@@ -154,6 +154,45 @@ router.post('/predict', protect, upload.single('fingerprint'), async (req, res) 
   }
 });
 
+// ─── MFS100 Proxy (avoids CORS — browser cannot call Mantra service directly) ──
+router.post('/mfs100-capture', protect, async (req, res) => {
+  const MFS100_ENDPOINTS = [
+    'http://localhost:8004/mfs100/capture',
+    'http://127.0.0.1:8004/mfs100/capture',
+    'http://localhost:8003/mfs100/capture',
+    'http://127.0.0.1:8003/mfs100/capture',
+  ];
+
+  const quality   = parseInt(req.body.quality)  || 70;
+  const capTimeout = parseInt(req.body.timeout) || 15;
+
+  let lastError = null;
+
+  for (const endpoint of MFS100_ENDPOINTS) {
+    try {
+      const mfsRes = await axios.post(
+        endpoint,
+        { data: JSON.stringify({ Quality: quality, TimeOut: capTimeout }) },
+        {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: (capTimeout + 6) * 1000,
+        }
+      );
+      return res.json({ success: true, data: mfsRes.data });
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  return res.status(503).json({
+    success: false,
+    error:
+      'MFS100 service is not reachable. ' +
+      'Make sure the Mantra RD Service (MantraRDService.exe) is running on this PC.',
+    details: lastError?.message,
+  });
+});
+
 // ─── Scanner Predict (accepts base64 from physical devices) ───────────────────
 router.post('/scanner-predict', protect, async (req, res) => {
   try {
@@ -181,12 +220,30 @@ router.post('/scanner-predict', protect, async (req, res) => {
         success: false,
         rejected: true,
         rejection_reason: mlResult.rejection_reason,
+        detected_image_type: mlResult.detected_image_type,
+        rejection_icon: mlResult.rejection_icon,
+        validation: mlResult.validation || {},
         source: 'scanner',
       });
     }
 
     if (!mlResult.success) {
       return res.status(500).json({ error: 'Scanner prediction failed.' });
+    }
+
+    const existingPrediction = await Prediction.findOne({
+      fingerprintHash: mlResult.fingerprint_hash,
+      user: { $ne: req.user._id },
+    });
+
+    let duplicateWarning = null;
+    if (existingPrediction) {
+      duplicateWarning = 'This fingerprint has been registered by another user. Suspicious activity flagged.';
+    }
+
+    if (!req.user.fingerprintHashes.includes(mlResult.fingerprint_hash)) {
+      req.user.fingerprintHashes.push(mlResult.fingerprint_hash);
+      await req.user.save();
     }
 
     // Save prediction
@@ -216,6 +273,9 @@ router.post('/scanner-predict', protect, async (req, res) => {
         createdAt: prediction.createdAt,
       },
       reliability: mlResult.reliability || null,
+      validation: mlResult.validation || null,
+      warnings: mlResult.warnings || [],
+      duplicateWarning,
     });
   } catch (error) {
     console.error('Scanner prediction error:', error.message);

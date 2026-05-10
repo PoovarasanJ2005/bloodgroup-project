@@ -47,6 +47,11 @@ export const predictionService = {
       headers: { 'Content-Type': 'multipart/form-data' },
       timeout: 30000,
     }),
+
+  // Proxy MFS100 capture through the server to avoid browser CORS block
+  mfs100Capture: (quality = 70) =>
+    api.post('/predictions/mfs100-capture', { quality, timeout: 15 }, { timeout: 25000 }),
+
   scannerPredict: (imageBase64, deviceName, resolution) =>
     api.post('/predictions/scanner-predict', {
       image_base64: imageBase64,

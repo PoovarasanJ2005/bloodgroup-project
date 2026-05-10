@@ -1,182 +1,295 @@
 """
-Image Validation Module — Strict Fingerprint-Only Filter
-=========================================================
-Philosophy: BLOCK everything that doesn't look EXACTLY like a fingerprint.
-Uses 7 gates — image must pass ALL to proceed to prediction.
+Fingerprint validation and normalization pipeline.
+
+Goal:
+1. Accept close-up fingertip photos in color or grayscale.
+2. Reject non-fingerprint content such as person photos, documents, or generic objects.
+3. Convert accepted inputs into a tight grayscale crop before prediction.
 """
 
-import numpy as np
-import cv2
-from PIL import Image
+from __future__ import annotations
+
 import io
+from typing import Dict, Optional, Tuple
+
+import cv2
+import numpy as np
+from PIL import Image
+
+_GABOR_BANK: Optional[list[np.ndarray]] = None
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# GATE 1: COLOR — Any color at all = not a fingerprint
-# ═══════════════════════════════════════════════════════════════════════════════
+def _load_image(image_bytes: bytes) -> Tuple[np.ndarray, np.ndarray]:
+    rgb = np.array(Image.open(io.BytesIO(image_bytes)).convert('RGB'))
+    gray = np.array(Image.fromarray(rgb).convert('L'))
+    return rgb, gray
 
-def _check_color(bgr):
-    """Reject any image with even slight color. Fingerprints are pure grayscale."""
-    if bgr is None:
-        return False, 0.0
 
-    # YCrCb is more robust than HSV for detecting color in dark images
+def _border_values(mask: np.ndarray) -> np.ndarray:
+    return np.concatenate([
+        mask[0, :],
+        mask[-1, :],
+        mask[:, 0],
+        mask[:, -1],
+    ])
+
+
+def _build_skin_mask(rgb: np.ndarray) -> np.ndarray:
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
-    cr = ycrcb[:, :, 1].astype(np.float64)
-    cb = ycrcb[:, :, 2].astype(np.float64)
-
-    # Pure gray: Cr≈128, Cb≈128. Any deviation = color present
-    cr_dev = float(np.std(cr)) + abs(float(np.mean(cr)) - 128)
-    cb_dev = float(np.std(cb)) + abs(float(np.mean(cb)) - 128)
-    chroma_score = cr_dev + cb_dev
-
-    # Also check HSV saturation
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    mean_sat = float(np.mean(hsv[:, :, 1]))
 
-    # Very strict: fingerprint scanners produce nearly zero chroma
-    is_color = chroma_score > 15 or mean_sat > 12
-    return is_color, round(chroma_score, 2)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# GATE 2: FACE / PERSON DETECTION — Multiple cascades + skin detection
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _check_person(gray, bgr):
-    """Detect human presence using cascades + skin color + smooth gradient areas."""
-    try:
-        cascades = [
-            'haarcascade_frontalface_default.xml',
-            'haarcascade_profileface.xml',
-            'haarcascade_frontalface_alt2.xml',
-            'haarcascade_upperbody.xml',
-            'haarcascade_eye.xml',
-        ]
-        for cascade_name in cascades:
-            try:
-                cascade = cv2.CascadeClassifier(
-                    cv2.data.haarcascades + cascade_name
-                )
-                detections = cascade.detectMultiScale(
-                    gray, scaleFactor=1.05, minNeighbors=3, minSize=(20, 20)
-                )
-                if len(detections) > 0:
-                    return True, f"Detected via {cascade_name}"
-            except Exception:
-                continue
-
-        # Skin-tone detection (works even in B&W-ish photos with slight color)
-        if bgr is not None:
-            ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
-            # Skin tone range in YCrCb
-            skin_mask = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
-            skin_ratio = float(np.sum(skin_mask > 0) / skin_mask.size)
-            if skin_ratio > 0.15:
-                return True, "Significant skin-tone regions detected"
-
-        # Large smooth gradient detection — person photos have smooth skin/clothing
-        # Fingerprints NEVER have large smooth gradients
-        block = 32
-        h, w = gray.shape
-        smooth_blocks = 0
-        total_blocks = 0
-        for y in range(0, h - block, block):
-            for x in range(0, w - block, block):
-                patch = gray[y:y+block, x:x+block].astype(np.float64)
-                local_var = np.var(patch)
-                total_blocks += 1
-                if local_var < 100:  # Very smooth patch
-                    smooth_blocks += 1
-
-        smooth_ratio = smooth_blocks / max(total_blocks, 1)
-        if smooth_ratio > 0.35:
-            return True, "Large smooth/gradient areas (not fingerprint texture)"
-
-    except Exception:
-        pass
-    return False, ""
+    skin_ycrcb = cv2.inRange(ycrcb, (0, 133, 77), (255, 183, 135))
+    skin_hsv = cv2.inRange(hsv, (0, 15, 40), (30, 170, 255))
+    mask = cv2.bitwise_and(skin_ycrcb, skin_hsv)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    return mask
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# GATE 3: EDGE DISTRIBUTION — Fingerprint edges must be EVERYWHERE
-# ═══════════════════════════════════════════════════════════════════════════════
+def _build_foreground_mask(gray: np.ndarray) -> np.ndarray:
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-def _check_edge_distribution(gray):
-    """
-    Fingerprints have fine edges distributed uniformly across the entire image.
-    Ornaments/borders have edges only in some areas. Posters have edges in text areas.
-    """
+    border_mean = float(np.mean(_border_values(thresh)))
+    if border_mean > 127:
+        mask = cv2.bitwise_not(thresh)
+    else:
+        mask = thresh
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    return mask
+
+
+def _texture_mask(gray: np.ndarray) -> np.ndarray:
+    lap = cv2.Laplacian(gray, cv2.CV_32F)
+    texture = cv2.convertScaleAbs(lap)
+    _, mask = cv2.threshold(texture, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return mask
+
+
+def _largest_contour(mask: np.ndarray) -> Optional[np.ndarray]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    return max(contours, key=cv2.contourArea)
+
+
+def _get_gabor_bank() -> list[np.ndarray]:
+    global _GABOR_BANK
+    if _GABOR_BANK is not None:
+        return _GABOR_BANK
+
+    kernels = []
+    for theta_deg in range(0, 180, 15):
+        theta = np.deg2rad(theta_deg)
+        kernel = cv2.getGaborKernel(
+            (21, 21),
+            sigma=4.0,
+            theta=theta,
+            lambd=10.0,
+            gamma=0.5,
+            psi=0,
+            ktype=cv2.CV_32F,
+        )
+        kernel -= np.mean(kernel)
+        kernel /= np.sum(np.abs(kernel)) + 1e-6
+        kernels.append(kernel)
+
+    _GABOR_BANK = kernels
+    return kernels
+
+
+def enhance_fingerprint_with_gabor(gray: np.ndarray) -> np.ndarray:
+    """Enhance ridge/valley structure with a directional Gabor filter bank."""
+    source = np.clip(gray, 0, 255).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(source)
+    denoised = cv2.bilateralFilter(clahe, 5, 35, 35)
+
+    responses = []
+    for kernel in _get_gabor_bank():
+        filtered = cv2.filter2D(denoised, cv2.CV_32F, kernel)
+        responses.append(np.abs(filtered))
+
+    ridge_response = np.max(np.stack(responses, axis=0), axis=0)
+    ridge_response = cv2.normalize(ridge_response, None, 0, 255, cv2.NORM_MINMAX)
+    ridge_response = ridge_response.astype(np.uint8)
+
+    enhanced = cv2.addWeighted(clahe, 0.62, ridge_response, 0.38, 0)
+    return cv2.medianBlur(enhanced, 3)
+
+
+def _expand_square(x: int, y: int, w: int, h: int, width: int, height: int, pad_ratio: float = 0.12) -> Tuple[int, int, int, int]:
+    side = int(max(w, h) * (1.0 + pad_ratio))
+    cx = x + w / 2.0
+    cy = y + h / 2.0
+
+    x1 = int(round(cx - side / 2.0))
+    y1 = int(round(cy - side / 2.0))
+    x2 = x1 + side
+    y2 = y1 + side
+
+    if x1 < 0:
+        x2 -= x1
+        x1 = 0
+    if y1 < 0:
+        y2 -= y1
+        y1 = 0
+    if x2 > width:
+        shift = x2 - width
+        x1 = max(0, x1 - shift)
+        x2 = width
+    if y2 > height:
+        shift = y2 - height
+        y1 = max(0, y1 - shift)
+        y2 = height
+
+    return x1, y1, x2, y2
+
+
+def _prepare_crop(rgb: np.ndarray, gray: np.ndarray) -> Tuple[Optional[np.ndarray], Dict[str, float]]:
+    h, w = gray.shape
+    fg_mask = _build_foreground_mask(gray)
+    skin_mask = _build_skin_mask(rgb)
+    texture_mask = _texture_mask(gray)
+
+    combined = cv2.bitwise_or(fg_mask, skin_mask)
+    combined = cv2.bitwise_and(combined, cv2.bitwise_or(texture_mask, combined))
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+
+    contour = _largest_contour(combined)
+    if contour is None or cv2.contourArea(contour) < 0.06 * (h * w):
+        contour = _largest_contour(fg_mask)
+
+    if contour is None or cv2.contourArea(contour) < 0.04 * (h * w):
+        return None, {
+            'crop_ratio': 0.0,
+            'skin_ratio': float(np.mean(skin_mask > 0)),
+            'foreground_ratio': float(np.mean(fg_mask > 0)),
+        }
+
+    x, y, cw, ch = cv2.boundingRect(contour)
+    x1, y1, x2, y2 = _expand_square(x, y, cw, ch, w, h)
+    crop = gray[y1:y2, x1:x2]
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    normalized = clahe.apply(crop)
+
+    return normalized, {
+        'crop_ratio': float((x2 - x1) * (y2 - y1) / (w * h)),
+        'skin_ratio': float(np.mean(skin_mask > 0)),
+        'foreground_ratio': float(np.mean(fg_mask > 0)),
+    }
+
+
+def normalize_fingerprint_image(
+    image_source,
+    target_size: Optional[int] = None,
+    return_metadata: bool = False,
+    enhance_ridges: bool = False,
+):
+    if isinstance(image_source, bytes):
+        rgb, gray = _load_image(image_source)
+    elif isinstance(image_source, np.ndarray):
+        array = image_source.astype(np.uint8)
+        if array.ndim == 2:
+            gray = array
+            rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+        else:
+            rgb = array
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    else:
+        raise TypeError('Unsupported image source type.')
+
+    processed, crop_meta = _prepare_crop(rgb, gray)
+    if processed is None:
+        processed = gray
+
+    if target_size is not None:
+        interpolation = cv2.INTER_AREA if processed.shape[0] > target_size else cv2.INTER_CUBIC
+        processed = cv2.resize(processed, (target_size, target_size), interpolation=interpolation)
+
+    if enhance_ridges:
+        processed = enhance_fingerprint_with_gabor(processed)
+
+    if return_metadata:
+        return processed, crop_meta
+    return processed
+
+def _check_person_photo(rgb: np.ndarray, gray: np.ndarray) -> Tuple[bool, str]:
+    cascade_names = [
+        'haarcascade_frontalface_default.xml',
+        'haarcascade_profileface.xml',
+        'haarcascade_upperbody.xml',
+    ]
+    for cascade_name in cascade_names:
+        cascade = cv2.CascadeClassifier(cv2.data.haarcascades + cascade_name)
+        detections = cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=(24, 24))
+        if len(detections) > 0:
+            return True, 'Detected a face or upper-body pattern.'
+
+    skin_ratio = float(np.mean(_build_skin_mask(rgb) > 0))
+    edge_density = float(np.mean(cv2.Canny(gray, 50, 150) > 0))
+    if skin_ratio > 0.55 and edge_density < 0.03:
+        return True, 'Large smooth skin region without fingerprint texture.'
+
+    return False, ''
+
+
+def _check_document_or_graphics(gray: np.ndarray) -> Tuple[bool, str]:
     edges = cv2.Canny(gray, 50, 150)
-    h, w = edges.shape
+    min_len = max(32, min(gray.shape) // 3)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 80, minLineLength=min_len, maxLineGap=8)
+    if lines is not None and len(lines) > 14:
+        return True, 'Too many long straight lines for a fingertip.'
 
-    # Divide into 4x4 grid and check edge density in each cell
+    if float(np.std(gray)) < 10:
+        return True, 'Image is nearly blank or flat.'
+
+    return False, ''
+
+
+def _check_edge_distribution(gray: np.ndarray) -> Tuple[bool, Dict[str, float]]:
+    edges = cv2.Canny(gray, 35, 120)
+    h, w = edges.shape
     grid = 4
     cell_h, cell_w = h // grid, w // grid
     densities = []
+
     for gy in range(grid):
         for gx in range(grid):
-            cell = edges[gy*cell_h:(gy+1)*cell_h, gx*cell_w:(gx+1)*cell_w]
-            density = float(np.sum(cell > 0)) / cell.size
-            densities.append(density)
+            cell = edges[gy * cell_h:(gy + 1) * cell_h, gx * cell_w:(gx + 1) * cell_w]
+            densities.append(float(np.mean(cell > 0)))
 
-    overall_density = float(np.sum(edges > 0)) / edges.size
+    overall_density = float(np.mean(edges > 0))
     active_cells = sum(1 for d in densities if d > 0.02)
     density_std = float(np.std(densities))
     density_mean = float(np.mean(densities))
-    uniformity = 1.0 - (density_std / (density_mean + 1e-10))
+    uniformity = 1.0 - (density_std / (density_mean + 1e-6))
 
-    # Fingerprints: edges in nearly all cells, moderate overall density
-    # Border ornament: edges in 2-4 cells only, rest empty
-    # Person photo: edges scattered but not fine/dense
-    passed = (
-        active_cells >= 10 and          # At least 10/16 cells have edges
-        0.03 < overall_density < 0.45 and  # Moderate edge density
-        uniformity > 0.15               # Reasonably uniform distribution
-    )
-    return passed, active_cells, round(overall_density, 4), round(uniformity, 3)
+    passed = active_cells >= 8 and 0.02 < overall_density < 0.45 and uniformity > 0.08
+    return passed, {
+        'active_cells': float(active_cells),
+        'edge_density': round(overall_density, 4),
+        'uniformity': round(uniformity, 3),
+    }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# GATE 4: STRAIGHT LINE REJECTION — Fingerprints have NO straight lines
-# ═══════════════════════════════════════════════════════════════════════════════
+def _verify_ridge_pattern(gray: np.ndarray) -> Tuple[bool, float, Dict[str, float]]:
+    gray = cv2.resize(gray, (256, 256), interpolation=cv2.INTER_AREA)
+    scores: Dict[str, float] = {}
 
-def _check_straight_lines(gray):
-    """Detect genuinely long straight lines (poster borders, text underlines).
-    Fingerprint ridges produce many SHORT approximately-straight segments — that's
-    normal. Only flag images with many LONG continuous straight lines."""
-    edges = cv2.Canny(gray, 50, 150)
-    h, w = gray.shape
-    # Only detect lines longer than 1/3 of image — these are truly straight
-    min_len = min(h, w) // 3
-    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=80,
-                            minLineLength=min_len, maxLineGap=5)
-    num_lines = 0 if lines is None else len(lines)
-    # Need many long straight lines to reject (fingerprints might have 1-3 edge artifacts)
-    return num_lines > 15, num_lines
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# GATE 5: RIDGE PATTERN VERIFICATION — The core fingerprint check
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _verify_ridge_pattern(gray):
-    """
-    Verify fingerprint-specific ridge patterns using:
-    1. Gabor filter directional response
-    2. FFT ridge frequency in specific band
-    3. Orientation field smoothness
-    4. Ridge spacing consistency
-    Returns (is_fingerprint, score, details)
-    """
-    scores = {}
-
-    # --- Gabor directionality ---
     gabor_responses = []
     for theta_deg in range(0, 180, 15):
         theta = np.deg2rad(theta_deg)
-        kernel = cv2.getGaborKernel((21, 21), sigma=4.0, theta=theta,
-                                     lambd=10.0, gamma=0.5, psi=0)
+        kernel = cv2.getGaborKernel((21, 21), sigma=4.0, theta=theta, lambd=10.0, gamma=0.5, psi=0)
         filtered = cv2.filter2D(gray, cv2.CV_64F, kernel)
         gabor_responses.append(float(np.mean(np.abs(filtered))))
 
@@ -185,35 +298,31 @@ def _verify_ridge_pattern(gray):
     directionality = gabor_std / (gabor_mean + 1e-10)
     scores['directionality'] = directionality
 
-    # --- Ridge density (orientation coherence) ---
     gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-    gxx = cv2.GaussianBlur(gx*gx, (15, 15), 3)
-    gyy = cv2.GaussianBlur(gy*gy, (15, 15), 3)
-    gxy = cv2.GaussianBlur(gx*gy, (15, 15), 3)
-    coherence = np.sqrt((gxx-gyy)**2 + 4*gxy**2) / (gxx+gyy+1e-10)
+    gxx = cv2.GaussianBlur(gx * gx, (15, 15), 3)
+    gyy = cv2.GaussianBlur(gy * gy, (15, 15), 3)
+    gxy = cv2.GaussianBlur(gx * gy, (15, 15), 3)
+    coherence = np.sqrt((gxx - gyy) ** 2 + 4 * gxy ** 2) / (gxx + gyy + 1e-10)
     ridge_density = float(np.mean(coherence))
     scores['ridge_density'] = ridge_density
 
-    # --- FFT frequency band check ---
     f = np.fft.fft2(gray.astype(np.float64))
     fshift = np.fft.fftshift(f)
     magnitude = np.abs(fshift)
     h, w = magnitude.shape
-    cy, cx = h//2, w//2
-    magnitude[cy-3:cy+3, cx-3:cx+3] = 0
+    cy, cx = h // 2, w // 2
+    magnitude[cy - 3:cy + 3, cx - 3:cx + 3] = 0
 
-    # Fingerprint ridges produce a specific annular peak in FFT
     max_r = min(cx, cy)
-    Y, X = np.ogrid[:h, :w]
-    R = np.sqrt((X-cx)**2 + (Y-cy)**2).astype(int)
+    yy, xx = np.ogrid[:h, :w]
     radial = np.zeros(max_r)
-    for r in range(max_r):
-        mask = R == r
+    radii = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2).astype(int)
+    for radius in range(max_r):
+        mask = radii == radius
         if np.any(mask):
-            radial[r] = np.mean(magnitude[mask])
+            radial[radius] = np.mean(magnitude[mask])
 
-    # Fingerprints peak in mid-frequency range (1/6 to 1/2 of max radius)
     low = max_r // 8
     mid_start = max_r // 6
     mid_end = max_r // 2
@@ -221,289 +330,197 @@ def _verify_ridge_pattern(gray):
 
     mid_energy = np.sum(radial[mid_start:mid_end])
     total_energy = np.sum(radial) + 1e-10
-    low_energy = np.sum(radial[1:low])
-    high_energy = np.sum(radial[high_start:])
-
     freq_ratio = float(mid_energy / total_energy)
     scores['freq_ratio'] = freq_ratio
 
-    # Check for clear annular peak (fingerprint signature)
+    peak_prominence = 0.0
     if mid_end > mid_start:
         peak_val = float(np.max(radial[mid_start:mid_end]))
         mean_val = float(np.mean(radial[1:])) + 1e-10
         peak_prominence = peak_val / mean_val
-    else:
-        peak_prominence = 0
     scores['peak_prominence'] = peak_prominence
 
-    # --- Orientation field smoothness ---
-    block_sz = 16
-    h, w = gray.shape
-    orientations = np.full((h//block_sz, w//block_sz), np.nan)
-    for by in range(h // block_sz):
-        for bx in range(w // block_sz):
-            blk = gray[by*block_sz:(by+1)*block_sz, bx*block_sz:(bx+1)*block_sz]
-            bx_ = cv2.Sobel(blk, cv2.CV_64F, 1, 0, ksize=3)
-            by_ = cv2.Sobel(blk, cv2.CV_64F, 0, 1, ksize=3)
-            angle = 0.5 * np.arctan2(2*np.sum(bx_*by_), np.sum(bx_*bx_ - by_*by_))
-            coh = np.sqrt(np.sum(bx_*bx_ - by_*by_)**2 + 4*np.sum(bx_*by_)**2)
-            coh /= (np.sum(bx_*bx_) + np.sum(by_*by_) + 1e-10)
-            if coh > 0.25:
+    block_size = 16
+    orientations = np.full((h // block_size, w // block_size), np.nan)
+    for by in range(h // block_size):
+        for bx in range(w // block_size):
+            block = gray[by * block_size:(by + 1) * block_size, bx * block_size:(bx + 1) * block_size]
+            block_gx = cv2.Sobel(block, cv2.CV_64F, 1, 0, ksize=3)
+            block_gy = cv2.Sobel(block, cv2.CV_64F, 0, 1, ksize=3)
+            angle = 0.5 * np.arctan2(2 * np.sum(block_gx * block_gy), np.sum(block_gx * block_gx - block_gy * block_gy))
+            block_coh = np.sqrt(np.sum(block_gx * block_gx - block_gy * block_gy) ** 2 + 4 * np.sum(block_gx * block_gy) ** 2)
+            block_coh /= (np.sum(block_gx * block_gx) + np.sum(block_gy * block_gy) + 1e-10)
+            if block_coh > 0.20:
                 orientations[by, bx] = angle
 
-    # Compute orientation smoothness (neighbors should have similar angles)
     valid = ~np.isnan(orientations)
-    if np.sum(valid) > 8:
-        diffs = []
-        rows, cols = orientations.shape
-        for r in range(rows-1):
-            for c in range(cols-1):
-                if valid[r,c] and valid[r,c+1]:
-                    d = abs(orientations[r,c] - orientations[r,c+1])
-                    d = min(d, np.pi - d)
-                    diffs.append(d)
-                if valid[r,c] and valid[r+1,c]:
-                    d = abs(orientations[r,c] - orientations[r+1,c])
-                    d = min(d, np.pi - d)
-                    diffs.append(d)
-        if diffs:
-            orient_smoothness = 1.0 - float(np.mean(diffs)) / (np.pi/2)
-        else:
-            orient_smoothness = 0.0
-    else:
-        orient_smoothness = 0.0
+    orientation_diffs = []
+    rows, cols = orientations.shape
+    for row in range(rows - 1):
+        for col in range(cols - 1):
+            if valid[row, col] and valid[row, col + 1]:
+                diff = abs(orientations[row, col] - orientations[row, col + 1])
+                orientation_diffs.append(min(diff, np.pi - diff))
+            if valid[row, col] and valid[row + 1, col]:
+                diff = abs(orientations[row, col] - orientations[row + 1, col])
+                orientation_diffs.append(min(diff, np.pi - diff))
+
+    orient_smoothness = 0.0
+    if orientation_diffs:
+        orient_smoothness = 1.0 - float(np.mean(orientation_diffs)) / (np.pi / 2)
+    orient_coverage = float(np.mean(valid))
     scores['orient_smoothness'] = orient_smoothness
+    scores['orient_coverage'] = orient_coverage
 
-    valid_ratio = float(np.sum(valid) / valid.size)
-    scores['orient_coverage'] = valid_ratio
-
-    # --- SCORING (balanced: strict on non-fingerprints, fair on real ones) ---
-    fp_score = 0.0
-
-    if directionality > 0.15:
-        fp_score += 0.18
-    elif directionality > 0.08:
-        fp_score += 0.09
-    if ridge_density > 0.30:
-        fp_score += 0.18
+    score = 0.0
+    if directionality > 0.12:
+        score += 0.16
+    elif directionality > 0.07:
+        score += 0.08
+    if ridge_density > 0.28:
+        score += 0.18
     elif ridge_density > 0.20:
-        fp_score += 0.09
-    if 0.25 < freq_ratio < 0.70:
-        fp_score += 0.16
-    elif 0.18 < freq_ratio < 0.75:
-        fp_score += 0.08
-    if peak_prominence > 1.5:
-        fp_score += 0.14
-    elif peak_prominence > 1.2:
-        fp_score += 0.07
-    if orient_smoothness > 0.4:
-        fp_score += 0.18
-    elif orient_smoothness > 0.25:
-        fp_score += 0.09
-    if valid_ratio > 0.3:
-        fp_score += 0.16
-    elif valid_ratio > 0.2:
-        fp_score += 0.08
+        score += 0.09
+    if 0.20 < freq_ratio < 0.75:
+        score += 0.16
+    elif 0.15 < freq_ratio < 0.82:
+        score += 0.08
+    if peak_prominence > 1.35:
+        score += 0.14
+    elif peak_prominence > 1.15:
+        score += 0.07
+    if orient_smoothness > 0.32:
+        score += 0.18
+    elif orient_smoothness > 0.22:
+        score += 0.09
+    if orient_coverage > 0.22:
+        score += 0.18
+    elif orient_coverage > 0.15:
+        score += 0.09
 
-    return fp_score >= 0.55, round(fp_score * 100, 1), scores
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# GATE 6: AI-GENERATED FINGERPRINT DETECTION
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def detect_ai_generated(image_bytes):
-    """Detect synthetic/AI-generated fingerprints."""
-    try:
-        img = Image.open(io.BytesIO(image_bytes)).convert('L')
-        gray = np.array(img.resize((256, 256)), dtype=np.uint8)
-
-        ai_score = 0.0
-
-        # Noise analysis — AI images are too clean
-        blurred = cv2.GaussianBlur(gray.astype(np.float64), (5, 5), 1.5)
-        noise = gray.astype(np.float64) - blurred
-        noise_std = float(np.std(noise))
-        if noise_std < 2.0:
-            ai_score += 0.3
-
-        # Ridge uniformity — AI fingerprints have unnaturally uniform spacing
-        block_sz = 32
-        spacings = []
-        h, w = gray.shape
-        for y in range(0, h-block_sz, block_sz):
-            for x in range(0, w-block_sz, block_sz):
-                blk = gray[y:y+block_sz, x:x+block_sz]
-                f = np.fft.fft2(blk.astype(np.float64))
-                mag = np.abs(np.fft.fftshift(f))
-                mag[block_sz//2, block_sz//2] = 0
-                idx = np.unravel_index(np.argmax(mag), mag.shape)
-                dist = np.sqrt((idx[0]-block_sz//2)**2 + (idx[1]-block_sz//2)**2)
-                if dist > 1:
-                    spacings.append(dist)
-        if len(spacings) > 3:
-            cv_spacing = float(np.std(spacings) / (np.mean(spacings) + 1e-10))
-            if cv_spacing < 0.12:
-                ai_score += 0.35
-
-        # Histogram entropy
-        hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).flatten()
-        hist = hist / (hist.sum() + 1e-10)
-        entropy = float(-np.sum(hist * np.log2(hist + 1e-10)))
-        if entropy > 7.5:
-            ai_score += 0.2
-
-        # Kurtosis of noise
-        kurt = float(np.mean((noise - np.mean(noise))**4) /
-                      (np.std(noise)**4 + 1e-10) - 3)
-        if abs(kurt) > 10:
-            ai_score += 0.15
-
-        is_ai = ai_score >= 0.55
-        reason = ("AI-generated fingerprint detected." if is_ai
-                  else "Passes authenticity check.")
-        return is_ai, round(ai_score * 100, 1), reason
-    except Exception as e:
-        return False, 0.0, f"AI detection failed: {e}"
+    return score >= 0.52, round(score * 100, 1), scores
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# GATE 7: QUALITY ASSESSMENT
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def assess_quality(image_bytes):
-    """Check image quality for reliable prediction."""
-    try:
-        img = Image.open(io.BytesIO(image_bytes)).convert('L')
-        gray = np.array(img, dtype=np.uint8)
-        issues = []
-        h, w = gray.shape
-
-        if h < 64 or w < 64:
-            issues.append("Image too small (min 64×64).")
-        if float(cv2.Laplacian(gray, cv2.CV_64F).var()) < 50:
-            issues.append("Image too blurry.")
-        if float(np.std(gray)) < 15:
-            issues.append("Very low contrast.")
-        mean_b = float(np.mean(gray))
-        if mean_b < 30:
-            issues.append("Image too dark.")
-        elif mean_b > 240:
-            issues.append("Image overexposed.")
-
-        score = max(0.0, 1.0 - len(issues) * 0.25)
-        return len(issues) == 0, round(score * 100, 1), issues
-    except Exception as e:
-        return False, 0.0, [f"Quality check failed: {e}"]
+def _to_gray_array(image_source) -> np.ndarray:
+    if isinstance(image_source, np.ndarray):
+        if image_source.ndim == 2:
+            return image_source.astype(np.uint8)
+        return cv2.cvtColor(image_source.astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    return _load_image(image_source)[1]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SMART IMAGE TYPE CLASSIFIER — Tell user what they uploaded
-# ═══════════════════════════════════════════════════════════════════════════════
+def detect_ai_generated(image_source) -> Tuple[bool, float, str]:
+    gray = cv2.resize(_to_gray_array(image_source), (256, 256), interpolation=cv2.INTER_AREA)
+    ai_score = 0.0
 
-def classify_image_type(image_bytes):
-    """
-    Classify what kind of image was uploaded so we can tell
-    the user specifically what they sent instead of "not a fingerprint."
-    Returns: (image_type: str, user_message: str, icon: str)
-    """
-    try:
-        pil_img = Image.open(io.BytesIO(image_bytes))
-        is_color = pil_img.mode in ('RGB', 'RGBA')
-        gray = np.array(pil_img.convert('L').resize((256, 256)), dtype=np.uint8)
-        bgr = None
-        if is_color:
-            rgb = np.array(pil_img.convert('RGB').resize((256, 256)), dtype=np.uint8)
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    except Exception:
-        return ("unreadable",
-                "We couldn't read this file. Try a JPEG or PNG fingerprint scan.",
-                "❌")
+    blurred = cv2.GaussianBlur(gray.astype(np.float64), (5, 5), 1.5)
+    noise = gray.astype(np.float64) - blurred
+    noise_std = float(np.std(noise))
+    if noise_std < 2.0:
+        ai_score += 0.25
 
-    # 1. Face / person photo
-    if bgr is not None:
-        cascades_to_try = [
-            'haarcascade_frontalface_default.xml',
-            'haarcascade_upperbody.xml',
-            'haarcascade_eye.xml',
-        ]
-        for c in cascades_to_try:
-            try:
-                det = cv2.CascadeClassifier(cv2.data.haarcascades + c)
-                if len(det.detectMultiScale(gray, 1.05, 3, minSize=(20, 20))) > 0:
-                    return ("person_photo",
-                            "You uploaded a photo of a person. Please upload a fingerprint "
-                            "scan — a close-up grayscale image of a fingertip captured by "
-                            "a scanner or inkpad.",
-                            "🧑")
-            except Exception:
-                continue
-        # Skin tone check
-        ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
-        skin = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
-        if float(np.sum(skin > 0) / skin.size) > 0.15:
-            return ("person_photo",
-                    "This image appears to contain a person's skin. "
-                    "Upload a fingerprint scan only.",
-                    "🧑")
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).flatten()
+    hist = hist / (hist.sum() + 1e-10)
+    entropy = float(-np.sum(hist * np.log2(hist + 1e-10)))
+    if entropy > 7.5:
+        ai_score += 0.20
 
-    # 2. Color photo (nature, food, objects, posters)
-    if bgr is not None:
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        mean_sat = float(np.mean(hsv[:, :, 1]))
-        if mean_sat > 20:
-            return ("color_photo",
-                    "You uploaded a color photo. Fingerprint scanners produce "
-                    "grayscale images. Please scan your fingerprint and upload "
-                    "the grayscale result.",
-                    "🖼️")
+    block_size = 32
+    spacings = []
+    h, w = gray.shape
+    for y in range(0, h - block_size, block_size):
+        for x in range(0, w - block_size, block_size):
+            block = gray[y:y + block_size, x:x + block_size]
+            f = np.fft.fft2(block.astype(np.float64))
+            mag = np.abs(np.fft.fftshift(f))
+            mag[block_size // 2, block_size // 2] = 0
+            idx = np.unravel_index(np.argmax(mag), mag.shape)
+            dist = np.sqrt((idx[0] - block_size // 2) ** 2 + (idx[1] - block_size // 2) ** 2)
+            if dist > 1:
+                spacings.append(dist)
 
-    # 3. QR code / barcode (regular grid pattern in FFT)
-    f = np.fft.fft2(gray.astype(np.float64))
-    mag = np.abs(np.fft.fftshift(f))
-    h, w = mag.shape
-    mag[h // 2 - 5:h // 2 + 5, w // 2 - 5:w // 2 + 5] = 0
-    p99 = np.percentile(mag, 99)
-    col_peaks = np.sum(mag[h // 2 - 10:h // 2 + 10, :] > p99)
-    row_peaks = np.sum(mag[:, w // 2 - 10:w // 2 + 10] > p99)
-    if col_peaks > 12 and row_peaks > 12:
-        return ("qr_barcode",
-                "This looks like a QR code or barcode. "
-                "Please upload a fingerprint scan instead.",
-                "📷")
+    if len(spacings) > 3:
+        cv_spacing = float(np.std(spacings) / (np.mean(spacings) + 1e-10))
+        if cv_spacing < 0.11:
+            ai_score += 0.35
 
-    # 4. Document / screenshot (many long straight lines)
-    edges = cv2.Canny(gray, 50, 150)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 100,
-                            minLineLength=gray.shape[0] // 3, maxLineGap=10)
-    if lines is not None and len(lines) > 10:
-        return ("document",
-                "This looks like a document, screenshot, or printed page. "
-                "Please upload a close-up scan of a fingertip.",
-                "📄")
+    kurtosis = float(np.mean((noise - np.mean(noise)) ** 4) / (np.std(noise) ** 4 + 1e-10) - 3)
+    if abs(kurtosis) > 10:
+        ai_score += 0.15
 
-    # 5. Blank / solid color
-    if float(np.std(gray)) < 12:
-        return ("blank_or_solid",
-                "This image is nearly blank or a solid color. "
-                "Please upload a fingerprint scan.",
-                "⬜")
-
-    # 6. Generic fallback
-    return ("unknown_image",
-            "This image doesn't appear to be a fingerprint. "
-            "Please upload a close-up grayscale scan of a fingertip "
-            "(JPEG, PNG, BMP, or TIFF from a fingerprint scanner).",
-            "🔍")
+    is_ai = ai_score >= 0.60
+    reason = 'AI-generated fingerprint detected.' if is_ai else 'Passes authenticity check.'
+    return is_ai, round(ai_score * 100, 1), reason
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN VALIDATION PIPELINE
-# ═══════════════════════════════════════════════════════════════════════════════
+def assess_quality(image_source) -> Tuple[bool, float, list[str]]:
+    gray = _to_gray_array(image_source)
+    issues = []
+    h, w = gray.shape
 
-def validate_image(image_bytes):
-    """Run the full validation pipeline with smart rejection messages."""
-    result = {
+    if h < 64 or w < 64:
+        issues.append('Image too small (minimum 64x64).')
+    if float(cv2.Laplacian(gray, cv2.CV_64F).var()) < 45:
+        issues.append('Image is too blurry.')
+    if float(np.std(gray)) < 14:
+        issues.append('Very low contrast fingerprint.')
+
+    mean_brightness = float(np.mean(gray))
+    if mean_brightness < 30:
+        issues.append('Image is too dark.')
+    elif mean_brightness > 240:
+        issues.append('Image is overexposed.')
+
+    score = max(0.0, 1.0 - 0.22 * len(issues))
+    return len(issues) == 0, round(score * 100, 1), issues
+
+
+def classify_image_type(rgb: np.ndarray, gray: np.ndarray, ridge_confidence: float = 0.0) -> Tuple[str, str, str]:
+    is_person, reason = _check_person_photo(rgb, gray)
+    if is_person:
+        return (
+            'person_photo',
+            'You uploaded a person or skin photo instead of a close-up fingertip fingerprint image.',
+            '🚫',
+        )
+
+    is_document, _ = _check_document_or_graphics(gray)
+    if is_document:
+        return (
+            'document_or_graphic',
+            'You uploaded a poster, design, screenshot, document, blank image, or other graphic instead of a fingertip fingerprint image.',
+            '🚫',
+        )
+
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    mean_sat = float(np.mean(hsv[:, :, 1]))
+    quantized = (rgb // 32).reshape(-1, 3)
+    _, counts = np.unique(quantized, axis=0, return_counts=True)
+    dominant_ratio = float(np.max(counts) / max(1, quantized.shape[0]))
+
+    if mean_sat > 18 and dominant_ratio > 0.18 and ridge_confidence < 40:
+        return (
+            'poster_or_design',
+            'You uploaded a poster, design, logo, or other graphic image instead of a close-up fingertip fingerprint.',
+            '🚫',
+        )
+
+    if mean_sat > 25 and ridge_confidence < 35:
+        return (
+            'generic_photo',
+            'You uploaded a normal photo such as a car, object, scene, or other non-fingerprint image. Please upload only a close-up picture of a fingertip fingerprint.',
+            '🚫',
+        )
+
+    return (
+        'unknown_image',
+        'The uploaded image does not look like a close-up fingertip fingerprint.',
+        '🚫',
+    )
+
+
+def validate_image(image_bytes: bytes, include_processed: bool = False) -> Dict[str, object]:
+    result: Dict[str, object] = {
         'is_valid': False,
         'is_fingerprint': False,
         'is_ai_generated': False,
@@ -515,83 +532,90 @@ def validate_image(image_bytes):
         'detected_image_type': None,
         'rejection_icon': None,
         'warnings': [],
+        'image_diagnostics': {},
     }
 
     try:
-        pil_img = Image.open(io.BytesIO(image_bytes))
-        is_color_img = pil_img.mode in ('RGB', 'RGBA', 'CMYK')
-        gray = np.array(pil_img.convert('L').resize((256, 256)), dtype=np.uint8)
-        bgr = None
-        if is_color_img:
-            rgb = np.array(pil_img.convert('RGB').resize((256, 256)), dtype=np.uint8)
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    except Exception as e:
-        result['rejection_reason'] = f"Cannot read image: {e}"
-        result['rejection_icon'] = '❌'
+        rgb, gray = _load_image(image_bytes)
+    except Exception as error:
+        result['rejection_reason'] = f'Cannot read image: {error}'
         result['detected_image_type'] = 'unreadable'
+        result['rejection_icon'] = '❌'
         return result
 
-    # ── GATE 1: Color check ──
-    if bgr is not None:
-        is_color, chroma = _check_color(bgr)
-        if is_color:
-            img_type, msg, icon = classify_image_type(image_bytes)
-            result['rejection_reason'] = msg
-            result['detected_image_type'] = img_type
+    color_saturation = float(np.mean(cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)[:, :, 1]))
+
+    crop, crop_meta = _prepare_crop(rgb, gray)
+    result['image_diagnostics'] = {
+        'color_saturation': round(color_saturation, 2),
+        'crop_ratio': round(float(crop_meta.get('crop_ratio', 0.0)), 4),
+        'skin_ratio': round(float(crop_meta.get('skin_ratio', 0.0)), 4),
+        'foreground_ratio': round(float(crop_meta.get('foreground_ratio', 0.0)), 4),
+    }
+    if crop is None:
+        scanner_edges_ok, scanner_edge_meta = _check_edge_distribution(gray)
+        scanner_is_fp, scanner_fp_confidence, scanner_ridge_meta = _verify_ridge_pattern(gray)
+
+        if color_saturation <= 5 and scanner_edges_ok and scanner_is_fp:
+            crop = gray
+            result['image_diagnostics'].update({
+                'scanner_full_frame_fallback': True,
+                **{
+                    f'ridge_{key}': round(float(value), 4)
+                    for key, value in scanner_ridge_meta.items()
+                },
+            })
+            result['warnings'].append(
+                'Scanner fingerprint accepted as a full-frame capture because foreground crop was sparse.'
+            )
+        else:
+            image_type, message, icon = classify_image_type(rgb, gray)
+            result['rejection_reason'] = message
+            result['detected_image_type'] = image_type
             result['rejection_icon'] = icon
-            result['fingerprint_confidence'] = 2.0
             return result
 
-    # ── GATE 2: Person/face detection ──
-    is_person, person_reason = _check_person(gray, bgr)
-    if is_person:
-        img_type, msg, icon = classify_image_type(image_bytes)
-        result['rejection_reason'] = msg
-        result['detected_image_type'] = img_type
-        result['rejection_icon'] = icon
-        result['fingerprint_confidence'] = 3.0
-        return result
-
-    # ── GATE 3: Edge distribution ──
-    edges_ok, active_cells, edge_density, uniformity = _check_edge_distribution(gray)
-    if not edges_ok:
-        img_type, msg, icon = classify_image_type(image_bytes)
-        result['rejection_reason'] = msg
-        result['detected_image_type'] = img_type
-        result['rejection_icon'] = icon
-        result['fingerprint_confidence'] = 5.0
-        return result
-
-    # ── GATE 4: Ridge pattern verification ──
-    is_fp, fp_conf, _ = _verify_ridge_pattern(gray)
+    edges_ok, edge_meta = _check_edge_distribution(crop)
+    is_fp, fp_confidence, ridge_meta = _verify_ridge_pattern(crop)
     result['is_fingerprint'] = is_fp
-    result['fingerprint_confidence'] = fp_conf
+    result['fingerprint_confidence'] = fp_confidence
+    result['image_diagnostics'].update({
+        f'ridge_{key}': round(float(value), 4)
+        for key, value in ridge_meta.items()
+    })
 
-    if not is_fp:
-        img_type, msg, icon = classify_image_type(image_bytes)
-        result['rejection_reason'] = msg
-        result['detected_image_type'] = img_type
+    if not edges_ok or not is_fp:
+        image_type, message, icon = classify_image_type(rgb, gray, fp_confidence)
+        result['rejection_reason'] = message
+        result['detected_image_type'] = image_type
         result['rejection_icon'] = icon
         return result
 
-    # ── GATE 5: AI detection ──
-    is_ai, ai_conf, _ = detect_ai_generated(image_bytes)
+    is_ai, ai_confidence, _ = detect_ai_generated(crop)
     result['is_ai_generated'] = is_ai
-    result['ai_confidence'] = ai_conf
+    result['ai_confidence'] = ai_confidence
     if is_ai:
-        result['rejection_reason'] = (
-            "This fingerprint appears AI-generated. "
-            "Only authentic fingerprint scans are accepted."
-        )
+        result['rejection_reason'] = 'This fingerprint looks synthetic or AI-generated. Please upload a real fingertip image.'
         result['detected_image_type'] = 'ai_generated'
         result['rejection_icon'] = '🤖'
         return result
 
-    # ── GATE 6: Quality ──
-    q_ok, q_score, issues = assess_quality(image_bytes)
-    result['quality_ok'] = q_ok
-    result['quality_score'] = q_score
-    result['warnings'] = issues
-    result['is_valid'] = True
-    return result
+    quality_ok, quality_score, issues = assess_quality(crop)
+    result['quality_ok'] = quality_ok
+    result['quality_score'] = quality_score
 
+    warnings = list(result.get('warnings', [])) + list(issues)
+    if color_saturation > 10:
+        warnings.append('Color fingertip image accepted and converted to grayscale automatically.')
+    if crop_meta['crop_ratio'] < 0.92 and not result['image_diagnostics'].get('scanner_full_frame_fallback'):
+        warnings.append('Fingerprint area was cropped automatically for close-up analysis.')
+    if edge_meta['edge_density'] < 0.04:
+        warnings.append('Fingerprint ridges are faint; better lighting or a closer capture may improve accuracy.')
+
+    result['warnings'] = warnings
+    result['is_valid'] = True
+
+    if include_processed:
+        result['processed_image'] = crop
+
+    return result

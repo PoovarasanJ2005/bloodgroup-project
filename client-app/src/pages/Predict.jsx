@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useDropzone } from 'react-dropzone';
 import { predictionService } from '../services/api';
@@ -10,6 +10,121 @@ import {
 } from 'react-icons/hi';
 import './Predict.css';
 
+// Scanner quality thresholds
+const MFS100_CAPTURE_QUALITY    = 70;
+const MFS100_MIN_ACCEPTED_QUALITY = 60;
+const MFS100_MAX_ACCEPTED_NFIQ    = 3;
+
+const stripDataUrlPrefix = (value) => {
+  if (!value || typeof value !== 'string') return '';
+  return value.includes(',') ? value.split(',', 2)[1] : value;
+};
+
+const getBase64Mime = (base64) => {
+  if (base64.startsWith('Qk')) return 'image/bmp';
+  if (base64.startsWith('iVBOR')) return 'image/png';
+  if (base64.startsWith('/9j/')) return 'image/jpeg';
+  return 'image/bmp';
+};
+
+const base64ToFile = (base64, filename, mimeType) => {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new File([bytes], filename, { type: mimeType });
+};
+
+const getScannerField = (payload, fieldNames) => {
+  for (const name of fieldNames) {
+    if (payload?.[name] !== undefined && payload?.[name] !== null) {
+      return payload[name];
+    }
+    if (payload?.data?.[name] !== undefined && payload?.data?.[name] !== null) {
+      return payload.data[name];
+    }
+  }
+  return undefined;
+};
+
+const parseScannerNumber = (value) => {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const captureFromMantraMfs100 = async () => {
+  // ── Route through the Node server to avoid browser CORS block ────────────
+  // The Mantra RD Service (port 8004/8003) does NOT send CORS headers,
+  // so the browser blocks any direct fetch().  The /mfs100-capture proxy
+  // on our Node server makes the call server-side where CORS does not apply.
+  let payload;
+  try {
+    const res = await predictionService.mfs100Capture(MFS100_CAPTURE_QUALITY);
+    if (!res.data.success) {
+      const err = new Error(res.data.error || 'MFS100 service not reachable.');
+      err.isServiceUnavailable = true;
+      throw err;
+    }
+    payload = res.data.data;
+  } catch (axiosErr) {
+    // 503 = server confirmed that MFS100 RD Service is not running
+    if (axiosErr.response?.status === 503) {
+      const svcErr = new Error(
+        axiosErr.response.data?.error ||
+        'MFS100 local service not running. Start MantraRDService.exe first.'
+      );
+      svcErr.isServiceUnavailable = true;
+      throw svcErr;
+    }
+    if (axiosErr.isServiceUnavailable) throw axiosErr;
+    throw axiosErr;
+  }
+
+  // ── Parse scanner payload (same field-name aliases as before) ────────────
+  const errorCode        = getScannerField(payload, ['ErrorCode', 'errorCode']);
+  const errorDescription = getScannerField(payload, ['ErrorDescription', 'errorDescription', 'Status', 'status']);
+  const rawBitmap        = getScannerField(payload, ['BitmapData', 'bitmapData', 'ImageData', 'imageData']);
+  const bitmapData       = stripDataUrlPrefix(rawBitmap);
+
+  if (!bitmapData) {
+    throw new Error(errorDescription || 'MFS100 did not return image data.');
+  }
+
+  if (errorCode !== undefined && String(errorCode) !== '0') {
+    throw new Error(errorDescription || `MFS100 capture failed (code ${errorCode}).`);
+  }
+
+  const quality = parseScannerNumber(getScannerField(payload, ['Quality', 'quality']));
+  const nfiq    = parseScannerNumber(getScannerField(payload, ['NFIQ', 'Nfiq', 'nfiq']));
+
+  if (quality !== null && quality < MFS100_MIN_ACCEPTED_QUALITY) {
+    const qualityError = new Error(
+      `Fingerprint quality is ${quality}. Rescan with the finger flat on the MFS100 sensor.`
+    );
+    qualityError.isCaptureQualityError = true;
+    throw qualityError;
+  }
+
+  if (nfiq !== null && nfiq > MFS100_MAX_ACCEPTED_NFIQ) {
+    const nfiqError = new Error(
+      `Fingerprint NFIQ is ${nfiq}. Rescan before prediction to avoid a wrong result.`
+    );
+    nfiqError.isCaptureQualityError = true;
+    throw nfiqError;
+  }
+
+  const mimeType = getBase64Mime(bitmapData);
+  return {
+    base64:     bitmapData,
+    mimeType,
+    previewUrl: `data:${mimeType};base64,${bitmapData}`,
+    deviceName: 'Mantra MFS100',
+    resolution: getScannerField(payload, ['Resolution', 'resolution']) || '500dpi',
+  };
+};
+
+
 const Predict = () => {
   const [file, setFile] = useState(null);
   const [preview, setPreview] = useState(null);
@@ -19,9 +134,11 @@ const Predict = () => {
   const [rejection, setRejection] = useState(null);
   const [reliability, setReliability] = useState(null);
   const [warnings, setWarnings] = useState([]);
-  const [scannerMode, setScannerMode] = useState(false);
+  const [scannerMode, setScannerMode] = useState(true);
   const [scannerStatus, setScannerStatus] = useState('idle');
   const canvasRef = useRef(null);
+  const autoScannerStartedRef = useRef(false);
+  const scannerCaptureInFlightRef = useRef(false);
 
   const onDrop = useCallback((acceptedFiles) => {
     const f = acceptedFiles[0];
@@ -77,74 +194,64 @@ const Predict = () => {
   };
 
   // ─── Scanner Support ──────────────────────────────────────────────────────
-  const handleScannerCapture = async () => {
+  const handleScannerCapture = useCallback(async (options = {}) => {
+    if (scannerCaptureInFlightRef.current) return;
+
+    scannerCaptureInFlightRef.current = true;
     setScannerStatus('scanning');
+    setLoading(true);
     setRejection(null);
     setResult(null);
     setReliability(null);
     setWarnings([]);
+    setDuplicateWarning(null);
 
     try {
-      // Try WebUSB for physical scanner
-      if (navigator.usb) {
-        try {
-          const device = await navigator.usb.requestDevice({
-            filters: [
-              { classCode: 0xFF }, // Vendor-specific
-              { classCode: 0x0E }, // Video/imaging class
-            ]
-          });
-          await device.open();
-          setScannerStatus('connected');
-          toast.success(`Scanner connected: ${device.productName || 'Device'}`);
+      const capture = await captureFromMantraMfs100();
+      setScannerStatus('connected');
+      setScannerMode(true);
+      setPreview(capture.previewUrl);
+      setFile(base64ToFile(capture.base64, 'mfs100-live-capture.bmp', capture.mimeType));
 
-          // Read from scanner (device-specific protocol)
-          if (device.configuration === null) {
-            await device.selectConfiguration(1);
-          }
-          await device.claimInterface(0);
+      const res = await predictionService.scannerPredict(
+        capture.base64,
+        capture.deviceName,
+        capture.resolution
+      );
 
-          // Trigger capture command (generic)
-          const captureCmd = new Uint8Array([0x01, 0x00]);
-          await device.transferOut(1, captureCmd);
+      if (res.data.success) {
+        setResult({
+          predictedBloodGroup: res.data.prediction.predictedBloodGroup,
+          confidence: res.data.prediction.confidence,
+          allProbabilities: res.data.prediction.allProbabilities,
+          predictionId: res.data.prediction.predictionId,
+          createdAt: res.data.prediction.createdAt,
+        });
+        setDuplicateWarning(res.data.duplicateWarning);
+        setReliability(res.data.reliability);
+        setWarnings(res.data.warnings || []);
+        toast.success('MFS100 live scan prediction complete!');
+      }
+    } catch (error) {
+      const status = error.response?.status;
+      const data = error.response?.data;
 
-          const result = await device.transferIn(1, 64 * 1024);
-          const imageData = new Uint8Array(result.data.buffer);
+      if (status === 422 && data?.rejected) {
+        setRejection(data);
+        toast.error('Scanner capture rejected. Rescan clearly.');
+      } else if (!options.silentNoService || !error.isServiceUnavailable) {
+        toast.error(error.message || data?.error || 'MFS100 scanner capture failed.');
+      }
 
-          // Convert to base64
-          const base64 = btoa(String.fromCharCode(...imageData));
-          const res = await predictionService.scannerPredict(
-            base64, device.productName, 'hardware'
-          );
-
-          if (res.data.success) {
-            setResult({
-              predictedBloodGroup: res.data.prediction.predictedBloodGroup,
-              confidence: res.data.prediction.confidence,
-              allProbabilities: res.data.prediction.allProbabilities,
-              predictionId: res.data.prediction.predictionId,
-              createdAt: res.data.prediction.createdAt,
-            });
-            setReliability(res.data.reliability);
-            toast.success('Scanner prediction complete!');
-          }
-
-          await device.releaseInterface(0);
-          await device.close();
-        } catch (_error) {
-          console.log('WebUSB not available, falling back to file input.');
-          fallbackScannerInput();
-          return;
-        }
-      } else {
+      if (!options.auto && error.isServiceUnavailable) {
         fallbackScannerInput();
       }
-    } catch (_error) {
-      toast.error('Scanner capture failed. Try uploading manually.');
     } finally {
+      scannerCaptureInFlightRef.current = false;
       setScannerStatus('idle');
+      setLoading(false);
     }
-  };
+  }, []);
 
   const fallbackScannerInput = () => {
     // Fallback: open file dialog for scanner-saved images
@@ -164,6 +271,17 @@ const Predict = () => {
     };
     input.click();
   };
+
+  useEffect(() => {
+    if (!scannerMode || autoScannerStartedRef.current) return;
+
+    autoScannerStartedRef.current = true;
+    const timer = window.setTimeout(() => {
+      handleScannerCapture({ auto: true, silentNoService: true });
+    }, 500);
+
+    return () => window.clearTimeout(timer);
+  }, [scannerMode, handleScannerCapture]);
 
   const resetForm = () => {
     setFile(null);
@@ -244,9 +362,9 @@ const Predict = () => {
                   {scannerStatus === 'scanning' && <div className="scanner-laser" />}
                 </div>
                 <p className="scanner-instruction">
-                  {scannerStatus === 'idle' && 'Connect your fingerprint scanner and click capture'}
+                  {scannerStatus === 'idle' && 'Connect Mantra MFS100 and place your finger to capture'}
                   {scannerStatus === 'scanning' && 'Place your finger on the scanner...'}
-                  {scannerStatus === 'connected' && 'Scanner connected! Reading fingerprint...'}
+                  {scannerStatus === 'connected' && 'MFS100 captured image. Sending to prediction...'}
                 </p>
               </div>
               <motion.button
@@ -259,15 +377,16 @@ const Predict = () => {
                 {scannerStatus === 'scanning' ? (
                   <>
                     <span className="spinner" style={{ width: 20, height: 20, borderWidth: 2 }} />
-                    Scanning...
+                    Capturing...
                   </>
                 ) : (
-                  <><HiOutlineDesktopComputer /> Capture from Scanner</>
+                  <><HiOutlineDesktopComputer /> Capture from MFS100</>
                 )}
               </motion.button>
               <div className="scanner-note">
-                <p>🔌 Supports USB fingerprint scanners via WebUSB API.</p>
-                <p>If no scanner detected, you can select a scanner-saved image file.</p>
+                <p>🔌 Requires <strong>MantraRDService.exe</strong> running on this PC (port 8004 / 8003).</p>
+                <p>Capture is routed through the server — CORS is bypassed automatically.</p>
+                <p>BMP image → quality check → AI validation → blood group prediction.</p>
               </div>
             </div>
           ) : (

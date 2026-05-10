@@ -24,7 +24,7 @@ if sys.platform == 'win32':
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import tensorflow as tf
 
-from image_validator import validate_image
+from image_validator import enhance_fingerprint_with_gabor, validate_image
 
 app = Flask(__name__)
 CORS(app, origins=["http://localhost:5173", "http://localhost:3000"])
@@ -39,6 +39,9 @@ IMG_SIZE = 96
 NUM_CHANNELS = 1  # Auto-detected from model (1=grayscale, 3=RGB)
 CONFIDENCE_THRESHOLD = 40.0   # Minimum % to trust prediction
 TOP2_MARGIN_THRESHOLD = 10.0  # Min gap between top-2 predictions
+DEPLOYMENT_CONFIDENCE_THRESHOLD = 85.0
+DEPLOYMENT_MARGIN_THRESHOLD = 25.0
+GABOR_MODEL_VERSIONS = {'fingertip_crop_gabor_v2'}
 
 model = None
 class_mapping = None
@@ -113,16 +116,54 @@ def load_model():
             metrics = json.load(f)
 
 
-def preprocess_image(image_bytes):
-    """Preprocess fingerprint image for CNN prediction.
-    Adapts to model input: grayscale (1ch) or RGB (3ch)."""
-    img = Image.open(io.BytesIO(image_bytes))
-    if NUM_CHANNELS == 3:
-        img = img.convert('RGB')
+def deployed_model_uses_gabor():
+    if not metrics:
+        return False
+    return metrics.get('model_version') in GABOR_MODEL_VERSIONS
+
+
+def deployed_model_uses_raw_pixel_scale():
+    if not metrics:
+        return False
+    return metrics.get('input_value_range') == '0_255'
+
+
+def preprocess_image(image_source, use_gabor=None):
+    """Preprocess a validated fingerprint crop for model inference."""
+    if use_gabor is None:
+        use_gabor = deployed_model_uses_gabor()
+
+    if isinstance(image_source, np.ndarray):
+        array = image_source.astype(np.uint8)
+        if array.ndim == 2:
+            if use_gabor:
+                array = np.array(Image.fromarray(array, mode='L').resize((IMG_SIZE, IMG_SIZE)), dtype=np.uint8)
+                array = enhance_fingerprint_with_gabor(array)
+            gray_img = Image.fromarray(array, mode='L')
+            rgb_img = gray_img.convert('RGB')
+        else:
+            rgb_img = Image.fromarray(array, mode='RGB')
+            gray_img = rgb_img.convert('L')
+            if use_gabor:
+                gray_img = gray_img.resize((IMG_SIZE, IMG_SIZE))
+                gray_img = Image.fromarray(enhance_fingerprint_with_gabor(np.array(gray_img)), mode='L')
+                rgb_img = gray_img.convert('RGB')
+        img = rgb_img if NUM_CHANNELS == 3 else gray_img
     else:
-        img = img.convert('L')
+        img = Image.open(io.BytesIO(image_source))
+        if use_gabor:
+            gray_array = np.array(img.convert('L'), dtype=np.uint8)
+            gray_array = np.array(Image.fromarray(gray_array, mode='L').resize((IMG_SIZE, IMG_SIZE)), dtype=np.uint8)
+            img = Image.fromarray(enhance_fingerprint_with_gabor(gray_array), mode='L')
+        if NUM_CHANNELS == 3:
+            img = img.convert('RGB')
+        else:
+            img = img.convert('L')
+
     img = img.resize((IMG_SIZE, IMG_SIZE))
-    img_array = np.array(img, dtype=np.float32) / 255.0
+    img_array = np.array(img, dtype=np.float32)
+    if not deployed_model_uses_raw_pixel_scale():
+        img_array = img_array / 255.0
     if NUM_CHANNELS == 1:
         img_array = img_array.reshape(1, IMG_SIZE, IMG_SIZE, 1)
     else:
@@ -140,6 +181,57 @@ def predict_with_tta(model_instance, img_array, n_augments=8):
         aug = tf.image.random_contrast(aug, 0.92, 1.08)
         preds.append(model_instance.predict(aug, verbose=0))
     return np.mean(preds, axis=0)
+
+
+def analyze_deployment_safety(predictions):
+    """Decide whether the model output is strong enough to show to a user."""
+    probs = predictions[0]
+    sorted_probs = np.sort(probs)[::-1]
+    top1 = float(sorted_probs[0]) * 100
+    top2 = float(sorted_probs[1]) * 100 if len(sorted_probs) > 1 else 0
+    margin = top1 - top2
+
+    if top1 < DEPLOYMENT_CONFIDENCE_THRESHOLD:
+        return False, (
+            f"Fingerprint accepted, but the model confidence is only {top1:.2f}%. "
+            "This capture is outside the model's reliable prediction range. "
+            "Use a clearer scanner-style fingerprint image or retrain the model "
+            "with labeled phone-captured fingerprints before trusting the result."
+        )
+
+    if margin < DEPLOYMENT_MARGIN_THRESHOLD:
+        return False, (
+            f"Fingerprint accepted, but the top blood-group candidates are too close "
+            f"(margin {margin:.2f}%). Please retake the fingerprint or retrain with "
+            "more labeled samples from this capture style."
+        )
+
+    return True, None
+
+
+def deployed_model_supports_phone_captures():
+    if not metrics:
+        return False
+    return metrics.get('model_version') in {
+        'fingertip_crop_grayscale_v1',
+        *GABOR_MODEL_VERSIONS,
+    }
+
+
+def analyze_capture_domain(validation):
+    diagnostics = validation.get('image_diagnostics', {})
+    color_saturation = float(diagnostics.get('color_saturation', 0.0))
+
+    if color_saturation > 10 and not deployed_model_supports_phone_captures():
+        return False, (
+            "Fingerprint accepted, but this is a phone-captured color fingertip image. "
+            "The deployed model was trained on scanner-style grayscale images, so showing "
+            "a blood-group result for this capture would be unreliable. Train and promote "
+            "a candidate model with labeled phone-captured fingerprints before trusting "
+            "this input style."
+        )
+
+    return True, None
 
 
 def compute_fingerprint_hash(image_bytes):
@@ -215,6 +307,7 @@ def health():
             'quality_check': True,
             'scanner_support': True,
             'confidence_gating': True,
+            'gabor_ridge_enhancement': deployed_model_uses_gabor(),
         }
     })
 
@@ -268,7 +361,7 @@ def predict():
 
     try:
         # ── Step 1: Validate the image ──
-        validation = validate_image(image_bytes)
+        validation = validate_image(image_bytes, include_processed=True)
 
         if not validation['is_valid']:
             return jsonify({
@@ -286,10 +379,27 @@ def predict():
             }), 422
 
         # ── Step 2: Predict ──
+        is_supported_domain, domain_reason = analyze_capture_domain(validation)
+        if not is_supported_domain:
+            return jsonify({
+                'success': False,
+                'rejected': True,
+                'rejection_reason': domain_reason,
+                'detected_image_type': 'unsupported_capture_style',
+                'rejection_icon': 'warning',
+                'validation': {
+                    'is_fingerprint': validation['is_fingerprint'],
+                    'is_ai_generated': validation['is_ai_generated'],
+                    'fingerprint_confidence': validation['fingerprint_confidence'],
+                    'ai_confidence': validation['ai_confidence'],
+                },
+            }), 422
+
+        processed_image = validation.get('processed_image', image_bytes)
         image_hash = compute_fingerprint_hash(image_bytes)
         feature_embedding = extract_feature_vector(image_bytes)
 
-        img_array = preprocess_image(image_bytes)
+        img_array = preprocess_image(processed_image)
         predictions = predict_with_tta(model, img_array, n_augments=8)
 
         predicted_class_idx = int(np.argmax(predictions[0]))
@@ -299,6 +409,22 @@ def predict():
         # ── Step 3: Reliability analysis ──
         is_reliable, confidence_level, reliability_details = \
             analyze_prediction_reliability(predictions)
+
+        is_safe_to_show, safety_reason = analyze_deployment_safety(predictions)
+        if not is_safe_to_show:
+            return jsonify({
+                'success': False,
+                'rejected': True,
+                'rejection_reason': safety_reason,
+                'detected_image_type': 'low_confidence_fingerprint',
+                'rejection_icon': 'warning',
+                'validation': {
+                    'is_fingerprint': validation['is_fingerprint'],
+                    'is_ai_generated': validation['is_ai_generated'],
+                    'fingerprint_confidence': validation['fingerprint_confidence'],
+                    'ai_confidence': validation['ai_confidence'],
+                },
+            }), 422
 
         # Build full results with all class probabilities
         all_probabilities = {}
@@ -385,7 +511,7 @@ def scanner_capture():
         image_bytes = base64.b64decode(b64_data)
 
         # Validate
-        validation = validate_image(image_bytes)
+        validation = validate_image(image_bytes, include_processed=True)
         if not validation['is_valid']:
             return jsonify({
                 'success': False,
@@ -394,9 +520,18 @@ def scanner_capture():
                 'source': 'scanner',
             }), 422
 
+        is_supported_domain, domain_reason = analyze_capture_domain(validation)
+        if not is_supported_domain:
+            return jsonify({
+                'success': False,
+                'rejected': True,
+                'rejection_reason': domain_reason,
+                'source': 'scanner',
+            }), 422
+
         # Predict
-        img_array = preprocess_image(image_bytes)
-        predictions = model.predict(img_array, verbose=0)
+        img_array = preprocess_image(validation.get('processed_image', image_bytes))
+        predictions = predict_with_tta(model, img_array, n_augments=8)
 
         predicted_class_idx = int(np.argmax(predictions[0]))
         confidence = float(predictions[0][predicted_class_idx])
@@ -404,6 +539,15 @@ def scanner_capture():
 
         is_reliable, confidence_level, reliability_details = \
             analyze_prediction_reliability(predictions)
+
+        is_safe_to_show, safety_reason = analyze_deployment_safety(predictions)
+        if not is_safe_to_show:
+            return jsonify({
+                'success': False,
+                'rejected': True,
+                'rejection_reason': safety_reason,
+                'source': 'scanner',
+            }), 422
 
         all_probabilities = {}
         for idx, prob in enumerate(predictions[0]):
@@ -426,6 +570,13 @@ def scanner_capture():
                 'confidence_level': confidence_level,
                 **reliability_details,
             },
+            'validation': {
+                'is_fingerprint': validation['is_fingerprint'],
+                'is_ai_generated': validation['is_ai_generated'],
+                'quality_score': validation['quality_score'],
+                'fingerprint_confidence': validation['fingerprint_confidence'],
+            },
+            'warnings': validation.get('warnings', []),
             'device_info': {
                 'device_name': data.get('device_name', 'Unknown Scanner'),
                 'resolution': data.get('resolution', 'Unknown'),
