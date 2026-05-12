@@ -53,14 +53,16 @@ const parseScannerNumber = (value) => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
-const captureFromMantraMfs100 = async () => {
+const captureFromMantraMfs100 = async (options = {}) => {
   // ── Route through the Node server to avoid browser CORS block ────────────
   // The Mantra RD Service (port 8004/8003) does NOT send CORS headers,
   // so the browser blocks any direct fetch().  The /mfs100-capture proxy
   // on our Node server makes the call server-side where CORS does not apply.
   let payload;
   try {
-    const res = await predictionService.mfs100Capture(MFS100_CAPTURE_QUALITY);
+    const res = await predictionService.mfs100Capture(MFS100_CAPTURE_QUALITY, {
+      allowSavedFileFallback: options.allowSavedFileFallback !== false,
+    });
     if (!res.data.success) {
       const err = new Error(res.data.error || 'MFS100 service not reachable.');
       err.isServiceUnavailable = true;
@@ -207,7 +209,9 @@ const Predict = () => {
     setDuplicateWarning(null);
 
     try {
-      const capture = await captureFromMantraMfs100();
+      const capture = await captureFromMantraMfs100({
+        allowSavedFileFallback: !options.auto,
+      });
       setScannerStatus('connected');
       setScannerMode(true);
       setPreview(capture.previewUrl);
@@ -504,6 +508,8 @@ const Predict = () => {
                       ? 'QR Code / Barcode Detected'
                       : rejection.detected_image_type === 'blank_or_solid'
                       ? 'Blank or Solid Image'
+                      : rejection.detected_image_type === 'low_confidence_fingerprint'
+                      ? 'Low Confidence Fingerprint'
                       : 'Not a Fingerprint Image'
                     }
                   </h3>

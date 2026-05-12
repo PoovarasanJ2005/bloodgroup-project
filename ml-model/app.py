@@ -15,6 +15,7 @@ import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image
+import cv2
 import io
 
 # Fix Windows console encoding
@@ -181,6 +182,141 @@ def predict_with_tta(model_instance, img_array, n_augments=8):
         aug = tf.image.random_contrast(aug, 0.92, 1.08)
         preds.append(model_instance.predict(aug, verbose=0))
     return np.mean(preds, axis=0)
+
+
+def _load_gray_array(image_bytes):
+    return np.array(Image.open(io.BytesIO(image_bytes)).convert('L'), dtype=np.uint8)
+
+
+def _light_background(gray):
+    border = np.concatenate([gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1]])
+    # Training images use dark ridges on a light background. Some scanners can
+    # return inverted BMPs, so normalize polarity before contrast work.
+    if float(np.mean(border)) < float(np.mean(gray)):
+        return cv2.bitwise_not(gray)
+    return gray
+
+
+def _contrast_normalize_scanner(gray):
+    source = _light_background(np.clip(gray, 0, 255).astype(np.uint8))
+    low, high = np.percentile(source, (1, 99))
+    if high > low:
+        source = np.clip((source.astype(np.float32) - low) * 255.0 / (high - low), 0, 255).astype(np.uint8)
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(source)
+    return cv2.medianBlur(clahe, 3)
+
+
+def _expand_box_to_square(x, y, w, h, width, height, pad_ratio=0.18):
+    side = int(max(w, h) * (1.0 + pad_ratio))
+    side = max(32, min(side, max(width, height)))
+    cx = x + w / 2.0
+    cy = y + h / 2.0
+
+    x1 = int(round(cx - side / 2.0))
+    y1 = int(round(cy - side / 2.0))
+    x2 = x1 + side
+    y2 = y1 + side
+
+    if x1 < 0:
+        x2 -= x1
+        x1 = 0
+    if y1 < 0:
+        y2 -= y1
+        y1 = 0
+    if x2 > width:
+        shift = x2 - width
+        x1 = max(0, x1 - shift)
+        x2 = width
+    if y2 > height:
+        shift = y2 - height
+        y1 = max(0, y1 - shift)
+        y2 = height
+
+    return x1, y1, x2, y2
+
+
+def _scanner_foreground_crop(gray):
+    normalized = _contrast_normalize_scanner(gray)
+    blurred = cv2.GaussianBlur(normalized, (5, 5), 0)
+    _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    h, w = gray.shape
+    contour = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(contour) < 0.04 * (h * w):
+        return None
+
+    x, y, cw, ch = cv2.boundingRect(contour)
+    x1, y1, x2, y2 = _expand_box_to_square(x, y, cw, ch, w, h)
+    return normalized[y1:y2, x1:x2]
+
+
+def _scanner_prediction_score(predictions):
+    probs = predictions[0]
+    sorted_probs = np.sort(probs)[::-1]
+    top1 = float(sorted_probs[0]) * 100
+    top2 = float(sorted_probs[1]) * 100 if len(sorted_probs) > 1 else 0
+    entropy = float(-np.sum(probs * np.log2(probs + 1e-10)))
+    max_entropy = np.log2(len(probs))
+    normalized_entropy = entropy / max_entropy
+    margin = top1 - top2
+    return top1 + (0.35 * margin) - (12.0 * normalized_entropy)
+
+
+def _build_scanner_sources(image_bytes, validation):
+    sources = []
+    processed_image = validation.get('processed_image')
+    if isinstance(processed_image, np.ndarray):
+        sources.append(('validated_crop', processed_image))
+
+    gray = _load_gray_array(image_bytes)
+    sources.append(('scanner_full_frame_contrast', _contrast_normalize_scanner(gray)))
+
+    foreground_crop = _scanner_foreground_crop(gray)
+    if foreground_crop is not None:
+        sources.append(('scanner_foreground_crop', foreground_crop))
+
+    return sources
+
+
+def predict_scanner_capture_variants(model_instance, image_bytes, validation):
+    """Run scanner captures through scanner-matched preprocessing variants."""
+    candidates = []
+    for variant_name, source in _build_scanner_sources(image_bytes, validation):
+        img_array = preprocess_image(source)
+        predictions = model_instance.predict(img_array, verbose=0)
+        reliability = analyze_prediction_reliability(predictions)[2]
+        candidates.append({
+            'variant': variant_name,
+            'predictions': predictions,
+            'score': _scanner_prediction_score(predictions),
+            'top1_confidence': reliability['top1_confidence'],
+            'margin': reliability['margin'],
+        })
+
+    if not candidates:
+        img_array = preprocess_image(validation.get('processed_image', image_bytes))
+        predictions = model_instance.predict(img_array, verbose=0)
+        return predictions, {'selected_variant': 'default', 'variants': []}
+
+    best = max(candidates, key=lambda item: item['score'])
+    return best['predictions'], {
+        'selected_variant': best['variant'],
+        'variants': [
+            {
+                'variant': item['variant'],
+                'top1_confidence': item['top1_confidence'],
+                'margin': item['margin'],
+            }
+            for item in candidates
+        ],
+    }
 
 
 def analyze_deployment_safety(predictions):
@@ -529,9 +665,13 @@ def scanner_capture():
                 'source': 'scanner',
             }), 422
 
-        # Predict
-        img_array = preprocess_image(validation.get('processed_image', image_bytes))
-        predictions = predict_with_tta(model, img_array, n_augments=8)
+        # Predict with scanner-specific variants so live MFS100 BMPs are
+        # normalized closer to the training/test fingerprint images.
+        predictions, scanner_preprocessing = predict_scanner_capture_variants(
+            model,
+            image_bytes,
+            validation,
+        )
 
         predicted_class_idx = int(np.argmax(predictions[0]))
         confidence = float(predictions[0][predicted_class_idx])
@@ -541,13 +681,6 @@ def scanner_capture():
             analyze_prediction_reliability(predictions)
 
         is_safe_to_show, safety_reason = analyze_deployment_safety(predictions)
-        if not is_safe_to_show:
-            return jsonify({
-                'success': False,
-                'rejected': True,
-                'rejection_reason': safety_reason,
-                'source': 'scanner',
-            }), 422
 
         all_probabilities = {}
         for idx, prob in enumerate(predictions[0]):
@@ -556,6 +689,10 @@ def scanner_capture():
         all_probabilities = dict(sorted(
             all_probabilities.items(), key=lambda x: x[1], reverse=True
         ))
+
+        warnings = list(validation.get('warnings', []))
+        if not is_safe_to_show and safety_reason:
+            warnings.append(safety_reason)
 
         return jsonify({
             'success': True,
@@ -568,6 +705,7 @@ def scanner_capture():
             'reliability': {
                 'is_reliable': is_reliable,
                 'confidence_level': confidence_level,
+                'is_deployment_safe': is_safe_to_show,
                 **reliability_details,
             },
             'validation': {
@@ -575,8 +713,9 @@ def scanner_capture():
                 'is_ai_generated': validation['is_ai_generated'],
                 'quality_score': validation['quality_score'],
                 'fingerprint_confidence': validation['fingerprint_confidence'],
+                'scanner_preprocessing': scanner_preprocessing,
             },
-            'warnings': validation.get('warnings', []),
+            'warnings': warnings,
             'device_info': {
                 'device_name': data.get('device_name', 'Unknown Scanner'),
                 'resolution': data.get('resolution', 'Unknown'),

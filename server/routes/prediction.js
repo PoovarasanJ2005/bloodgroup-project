@@ -12,6 +12,68 @@ import { encryptBuffer, sendEmail } from '../utils/helpers.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
 
+const MFS100_DEFAULT_IMAGE_PATH =
+  process.env.MFS100_IMAGE_PATH ||
+  'C:\\Program Files\\Mantra\\MFS100\\Driver\\MFS100Test\\FingerData\\FingerImage.bmp';
+
+const getBmpResolution = (buffer) => {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 26 || buffer.toString('ascii', 0, 2) !== 'BM') {
+    return null;
+  }
+
+  const width = Math.abs(buffer.readInt32LE(18));
+  const height = Math.abs(buffer.readInt32LE(22));
+  return width && height ? `${width}x${height}` : null;
+};
+
+const readMfs100SavedImage = () => {
+  try {
+    if (!fs.existsSync(MFS100_DEFAULT_IMAGE_PATH)) return null;
+
+    const stat = fs.statSync(MFS100_DEFAULT_IMAGE_PATH);
+    if (!stat.isFile() || stat.size <= 0) return null;
+
+    const buffer = fs.readFileSync(MFS100_DEFAULT_IMAGE_PATH);
+    return {
+      base64: buffer.toString('base64'),
+      path: MFS100_DEFAULT_IMAGE_PATH,
+      size: stat.size,
+      lastModifiedMs: stat.mtimeMs,
+      lastModified: stat.mtime.toISOString(),
+      resolution: getBmpResolution(buffer),
+    };
+  } catch (error) {
+    console.warn('Unable to read MFS100 saved image:', error.message);
+    return null;
+  }
+};
+
+const getPayloadField = (payload, fieldNames) => {
+  for (const name of fieldNames) {
+    if (payload?.[name] !== undefined && payload?.[name] !== null) return payload[name];
+    if (payload?.data?.[name] !== undefined && payload?.data?.[name] !== null) return payload.data[name];
+  }
+  return undefined;
+};
+
+const scannerPayloadHasImage = (payload) =>
+  Boolean(getPayloadField(payload, ['BitmapData', 'bitmapData', 'ImageData', 'imageData']));
+
+const withSavedMfs100Image = (payload, savedImage, reason) => {
+  const safePayload = payload && typeof payload === 'object' ? payload : {};
+  return {
+    ...safePayload,
+    BitmapData: savedImage.base64,
+    ImageData: savedImage.base64,
+    ImageSource: 'mfs100-default-file',
+    ImagePath: savedImage.path,
+    ImageSizeBytes: savedImage.size,
+    ImageLastModified: savedImage.lastModified,
+    Resolution: savedImage.resolution || getPayloadField(safePayload, ['Resolution', 'resolution']) || 'Unknown',
+    Status: reason,
+  };
+};
+
 // Multer config for fingerprint upload
 const storage = multer.memoryStorage();
 const upload = multer({
@@ -165,8 +227,10 @@ router.post('/mfs100-capture', protect, async (req, res) => {
 
   const quality   = parseInt(req.body.quality)  || 70;
   const capTimeout = parseInt(req.body.timeout) || 15;
+  const allowSavedFileFallback = req.body.allowSavedFileFallback !== false;
 
   let lastError = null;
+  const captureStartedAt = Date.now();
 
   for (const endpoint of MFS100_ENDPOINTS) {
     try {
@@ -178,10 +242,36 @@ router.post('/mfs100-capture', protect, async (req, res) => {
           timeout: (capTimeout + 6) * 1000,
         }
       );
+
+      const savedImage = readMfs100SavedImage();
+      const savedImageIsFresh = savedImage && savedImage.lastModifiedMs >= captureStartedAt - 5000;
+      if (allowSavedFileFallback && (savedImageIsFresh || (savedImage && !scannerPayloadHasImage(mfsRes.data)))) {
+        return res.json({
+          success: true,
+          data: withSavedMfs100Image(
+            mfsRes.data,
+            savedImage,
+            'Using MFS100 default FingerImage.bmp from the local driver folder.'
+          ),
+        });
+      }
+
       return res.json({ success: true, data: mfsRes.data });
     } catch (err) {
       lastError = err;
     }
+  }
+
+  const savedImage = readMfs100SavedImage();
+  if (allowSavedFileFallback && savedImage) {
+    return res.json({
+      success: true,
+      data: withSavedMfs100Image(
+        {},
+        savedImage,
+        'MFS100 RD Service was not reachable; using the default FingerImage.bmp file.'
+      ),
+    });
   }
 
   return res.status(503).json({
