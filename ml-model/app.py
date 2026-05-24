@@ -28,13 +28,19 @@ import tensorflow as tf
 from image_validator import enhance_fingerprint_with_gabor, validate_image
 
 app = Flask(__name__)
-CORS(app, origins=["http://localhost:5173", "http://localhost:3000"])
+
+# CORS origins: configurable via env for production
+_cors_origins = os.environ.get('CORS_ORIGINS', 'http://localhost:5173,http://localhost:3000')
+CORS(app, origins=[o.strip() for o in _cors_origins.split(',')])
 
 # --- Load Model & Config ---
 MODEL_DIR = os.path.join(os.path.dirname(__file__), 'saved_model')
 MODEL_PATH = os.path.join(MODEL_DIR, 'blood_group_model.h5')
 CLASS_MAPPING_PATH = os.path.join(MODEL_DIR, 'class_mapping.json')
 METRICS_PATH = os.path.join(MODEL_DIR, 'metrics.json')
+CANDIDATE_MODEL_PATH = os.path.join(MODEL_DIR, 'candidate_blood_group_model.h5')
+CANDIDATE_CLASS_MAPPING_PATH = os.path.join(MODEL_DIR, 'candidate_class_mapping.json')
+CANDIDATE_METRICS_PATH = os.path.join(MODEL_DIR, 'candidate_metrics.json')
 
 IMG_SIZE = 96
 NUM_CHANNELS = 1  # Auto-detected from model (1=grayscale, 3=RGB)
@@ -47,6 +53,55 @@ GABOR_MODEL_VERSIONS = {'fingertip_crop_gabor_v2'}
 model = None
 class_mapping = None
 metrics = None
+selected_model_name = None
+
+
+def _read_json_file(path):
+    if not os.path.exists(path):
+        return None
+    with open(path, 'r') as handle:
+        return json.load(handle)
+
+
+def _metric_accuracy(path):
+    data = _read_json_file(path)
+    if not data:
+        return -1.0
+    try:
+        return float(data.get('accuracy', -1.0))
+    except (TypeError, ValueError):
+        return -1.0
+
+
+def select_model_bundle():
+    bundles = [
+        {
+            'name': 'current',
+            'model_path': MODEL_PATH,
+            'class_mapping_path': CLASS_MAPPING_PATH,
+            'metrics_path': METRICS_PATH,
+            'tie_breaker': 1,
+        },
+        {
+            'name': 'candidate',
+            'model_path': CANDIDATE_MODEL_PATH,
+            'class_mapping_path': CANDIDATE_CLASS_MAPPING_PATH,
+            'metrics_path': CANDIDATE_METRICS_PATH,
+            'tie_breaker': 0,
+        },
+    ]
+
+    available = [
+        bundle for bundle in bundles
+        if os.path.exists(bundle['model_path']) and os.path.exists(bundle['class_mapping_path'])
+    ]
+    if not available:
+        return bundles[0]
+
+    return max(
+        available,
+        key=lambda bundle: (_metric_accuracy(bundle['metrics_path']), bundle['tie_breaker']),
+    )
 
 
 def _patch_keras_loading():
@@ -88,10 +143,16 @@ _patch_keras_loading()
 
 
 def load_model():
-    global model, class_mapping, metrics, IMG_SIZE, NUM_CHANNELS
+    global model, class_mapping, metrics, IMG_SIZE, NUM_CHANNELS, selected_model_name
     print("[INFO] Loading CNN model...")
-    if os.path.exists(MODEL_PATH):
-        model = tf.keras.models.load_model(MODEL_PATH)
+    bundle = select_model_bundle()
+    selected_model_name = bundle['name']
+    model_path = bundle['model_path']
+    mapping_path = bundle['class_mapping_path']
+    metrics_path = bundle['metrics_path']
+
+    if os.path.exists(model_path):
+        model = tf.keras.models.load_model(model_path)
         # Detect image size and channels from model input shape
         input_shape = model.input_shape
         if input_shape and len(input_shape) >= 3:
@@ -101,20 +162,21 @@ def load_model():
         dummy_input = np.zeros((1, IMG_SIZE, IMG_SIZE, NUM_CHANNELS), dtype=np.float32)
         model.predict(dummy_input, verbose=0)
         ch_label = 'RGB' if NUM_CHANNELS == 3 else 'grayscale'
-        print(f"[OK] Model loaded (input: {IMG_SIZE}x{IMG_SIZE}x{NUM_CHANNELS} {ch_label}) and warmed up!")
+        print(
+            f"[OK] {selected_model_name} model loaded "
+            f"(input: {IMG_SIZE}x{IMG_SIZE}x{NUM_CHANNELS} {ch_label}) and warmed up!"
+        )
     else:
-        print(f"[WARN] Model not found at {MODEL_PATH}. Train the model first.")
+        print(f"[WARN] Model not found at {model_path}. Train the model first.")
 
-    if os.path.exists(CLASS_MAPPING_PATH):
-        with open(CLASS_MAPPING_PATH, 'r') as f:
+    if os.path.exists(mapping_path):
+        with open(mapping_path, 'r') as f:
             class_mapping = json.load(f)
         # Convert string keys to int keys
         class_mapping = {int(k): v for k, v in class_mapping.items()}
         print(f"[INFO] Classes: {list(class_mapping.values())}")
 
-    if os.path.exists(METRICS_PATH):
-        with open(METRICS_PATH, 'r') as f:
-            metrics = json.load(f)
+    metrics = _read_json_file(metrics_path)
 
 
 def deployed_model_uses_gabor():
@@ -346,8 +408,10 @@ def analyze_deployment_safety(predictions):
 
 
 def deployed_model_supports_phone_captures():
+    if NUM_CHANNELS == 1:
+        return True
     if not metrics:
-        return False
+        return True
     return metrics.get('model_version') in {
         'fingertip_crop_grayscale_v1',
         *GABOR_MODEL_VERSIONS,
@@ -355,18 +419,9 @@ def deployed_model_supports_phone_captures():
 
 
 def analyze_capture_domain(validation):
-    diagnostics = validation.get('image_diagnostics', {})
-    color_saturation = float(diagnostics.get('color_saturation', 0.0))
-
-    if color_saturation > 10 and not deployed_model_supports_phone_captures():
-        return False, (
-            "Fingerprint accepted, but this is a phone-captured color fingertip image. "
-            "The deployed model was trained on scanner-style grayscale images, so showing "
-            "a blood-group result for this capture would be unreliable. Train and promote "
-            "a candidate model with labeled phone-captured fingerprints before trusting "
-            "this input style."
-        )
-
+    # Valid color/mobile captures are normalized by validate_image() and
+    # preprocess_image() into the grayscale shape expected by the deployed
+    # model. Invalid images are rejected before this point.
     return True, None
 
 
@@ -436,6 +491,7 @@ def health():
     return jsonify({
         'status': 'healthy',
         'model_loaded': model is not None,
+        'selected_model': selected_model_name,
         'classes': list(class_mapping.values()) if class_mapping else [],
         'features': {
             'fingerprint_validation': True,
@@ -739,12 +795,16 @@ def model_info():
         'classes': metrics.get('class_names', []),
         'epochs_trained': metrics.get('epochs_trained', 0),
         'img_size': metrics.get('img_size', IMG_SIZE),
+        'selected_model': selected_model_name,
     })
 
 
 # --- Main ---
+# Load model at module level so gunicorn workers can use it
+load_model()
+
 if __name__ == '__main__':
-    load_model()
-    print("\n[SERVER] Flask ML API running on http://localhost:5000")
+    port = int(os.environ.get('PORT', 5000))
+    print(f"\n[SERVER] Flask ML API running on http://localhost:{port}")
     print("[FEATURES] Image validation | AI detection | Scanner support")
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False)

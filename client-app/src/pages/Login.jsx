@@ -2,8 +2,9 @@ import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { useAuth } from '../context/useAuth';
+import { useTheme } from '../context/ThemeContext';
 import toast from 'react-hot-toast';
-import { HiOutlineMail, HiOutlineLockClosed, HiOutlineFingerPrint } from 'react-icons/hi';
+import { HiOutlineMail, HiOutlineLockClosed, HiOutlineFingerPrint, HiOutlineSun, HiOutlineMoon } from 'react-icons/hi';
 import './Auth.css';
 
 const Login = () => {
@@ -12,6 +13,7 @@ const Login = () => {
   const [loading, setLoading] = useState(false);
   const { login } = useAuth();
   const navigate = useNavigate();
+  const { theme, toggleTheme } = useTheme();
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -29,6 +31,21 @@ const Login = () => {
 
   return (
     <div className="auth-page">
+      {/* Theme toggle */}
+      <div className="auth-theme-toggle">
+        <motion.button
+          className="theme-toggle"
+          onClick={toggleTheme}
+          title={theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+          whileHover={{ scale: 1.15, rotate: 20 }}
+          whileTap={{ scale: 0.9 }}
+        >
+          <motion.span className="icon" key={theme} initial={{ rotate: -90, opacity: 0 }} animate={{ rotate: 0, opacity: 1 }} transition={{ duration: 0.3 }}>
+            {theme === 'dark' ? <HiOutlineSun /> : <HiOutlineMoon />}
+          </motion.span>
+        </motion.button>
+      </div>
+
       {/* Animated background orbs */}
       <div className="auth-bg-orbs">
         <div className="orb orb-1" />

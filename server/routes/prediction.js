@@ -228,6 +228,7 @@ router.post('/mfs100-capture', protect, async (req, res) => {
   const quality   = parseInt(req.body.quality)  || 70;
   const capTimeout = parseInt(req.body.timeout) || 15;
   const allowSavedFileFallback = req.body.allowSavedFileFallback !== false;
+  const preferSavedFile = req.body.preferSavedFile !== false;
 
   let lastError = null;
   const captureStartedAt = Date.now();
@@ -245,7 +246,11 @@ router.post('/mfs100-capture', protect, async (req, res) => {
 
       const savedImage = readMfs100SavedImage();
       const savedImageIsFresh = savedImage && savedImage.lastModifiedMs >= captureStartedAt - 5000;
-      if (allowSavedFileFallback && (savedImageIsFresh || (savedImage && !scannerPayloadHasImage(mfsRes.data)))) {
+      if (
+        allowSavedFileFallback &&
+        savedImage &&
+        (preferSavedFile || savedImageIsFresh || !scannerPayloadHasImage(mfsRes.data))
+      ) {
         return res.json({
           success: true,
           data: withSavedMfs100Image(
@@ -286,10 +291,19 @@ router.post('/mfs100-capture', protect, async (req, res) => {
 // ─── Scanner Predict (accepts base64 from physical devices) ───────────────────
 router.post('/scanner-predict', protect, async (req, res) => {
   try {
-    const { image_base64, device_name, resolution } = req.body;
+    let { image_base64, device_name, resolution } = req.body;
 
     if (!image_base64) {
-      return res.status(400).json({ error: 'No scanner image data provided.' });
+      const savedImage = readMfs100SavedImage();
+      if (!savedImage) {
+        return res.status(400).json({
+          error: `No scanner image data provided and default image not found at ${MFS100_DEFAULT_IMAGE_PATH}.`,
+        });
+      }
+
+      image_base64 = savedImage.base64;
+      device_name = device_name || 'Mantra MFS100';
+      resolution = resolution || savedImage.resolution || 'Unknown';
     }
 
     // Forward to Flask scanner endpoint

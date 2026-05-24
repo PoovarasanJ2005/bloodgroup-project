@@ -2,16 +2,19 @@ import { useState } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { useAuth } from '../../context/useAuth';
+import { useTheme } from '../../context/ThemeContext';
 import {
   HiOutlineHome, HiOutlineFingerPrint, HiOutlineClock,
   HiOutlineChartBar, HiOutlineUsers, HiOutlineCog,
   HiOutlineLogout, HiOutlineMenu, HiOutlineX,
-  HiOutlineShieldCheck, HiOutlineUser
+  HiOutlineShieldCheck, HiOutlineUser,
+  HiOutlineSun, HiOutlineMoon
 } from 'react-icons/hi';
 import './Layout.css';
 
 const Sidebar = () => {
   const { user, isAdmin, logout } = useAuth();
+  const { theme, toggleTheme } = useTheme();
   const location = useLocation();
   const navigate = useNavigate();
   const [collapsed, setCollapsed] = useState(false);
@@ -97,7 +100,7 @@ const Sidebar = () => {
           )}
         </nav>
 
-        {/* User info */}
+        {/* User info + Theme Toggle */}
         <div className="sidebar-footer">
           {!collapsed && (
             <div className="user-info">
@@ -114,7 +117,45 @@ const Sidebar = () => {
                   )}
                 </p>
               </div>
+              {/* Theme Toggle */}
+              <motion.button
+                className="theme-toggle"
+                onClick={toggleTheme}
+                title={theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+                whileHover={{ scale: 1.15, rotate: 20 }}
+                whileTap={{ scale: 0.9 }}
+              >
+                <motion.span
+                  className="icon"
+                  key={theme}
+                  initial={{ rotate: -90, opacity: 0 }}
+                  animate={{ rotate: 0, opacity: 1 }}
+                  transition={{ duration: 0.3 }}
+                >
+                  {theme === 'dark' ? <HiOutlineSun /> : <HiOutlineMoon />}
+                </motion.span>
+              </motion.button>
             </div>
+          )}
+          {collapsed && (
+            <motion.button
+              className="theme-toggle"
+              onClick={toggleTheme}
+              title={theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+              whileHover={{ scale: 1.15, rotate: 20 }}
+              whileTap={{ scale: 0.9 }}
+              style={{ margin: '0 auto 12px', display: 'flex' }}
+            >
+              <motion.span
+                className="icon"
+                key={theme}
+                initial={{ rotate: -90, opacity: 0 }}
+                animate={{ rotate: 0, opacity: 1 }}
+                transition={{ duration: 0.3 }}
+              >
+                {theme === 'dark' ? <HiOutlineSun /> : <HiOutlineMoon />}
+              </motion.span>
+            </motion.button>
           )}
           <button className="btn-logout" onClick={handleLogout} title="Logout">
             <HiOutlineLogout />

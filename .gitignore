@@ -5,10 +5,7 @@ __pycache__/
 venv/
 env/
 
-# Datasets and large ML files
-ml-model/saved_model/
-
-# Environment files
+# Environment files (secrets)
 .env
 .env.local
 .env.development
@@ -29,5 +26,18 @@ dist/
 build/
 .next/
 
-# Uploads
+# Uploads (encrypted fingerprints)
 server/uploads/
+
+# Dataset images (too large for git)
+dataset/train/
+dataset/test/
+dataset/dataset_blood_group/
+
+# ML model weights (tracked via Git LFS)
+# ml-model/saved_model/  — now tracked via LFS
+
+# Misc
+*.enc
+build_output.txt
+eslint_output.txt

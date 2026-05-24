@@ -62,6 +62,7 @@ const captureFromMantraMfs100 = async (options = {}) => {
   try {
     const res = await predictionService.mfs100Capture(MFS100_CAPTURE_QUALITY, {
       allowSavedFileFallback: options.allowSavedFileFallback !== false,
+      preferSavedFile: options.preferSavedFile !== false,
     });
     if (!res.data.success) {
       const err = new Error(res.data.error || 'MFS100 service not reachable.');
@@ -211,6 +212,7 @@ const Predict = () => {
     try {
       const capture = await captureFromMantraMfs100({
         allowSavedFileFallback: !options.auto,
+        preferSavedFile: options.preferSavedFile !== false,
       });
       setScannerStatus('connected');
       setScannerMode(true);

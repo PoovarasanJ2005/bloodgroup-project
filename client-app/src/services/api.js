@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const API_URL = 'http://localhost:5001/api';
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5001/api';
 
 const api = axios.create({
   baseURL: API_URL,
@@ -48,7 +48,6 @@ export const predictionService = {
       timeout: 30000,
     }),
 
-  // Proxy MFS100 capture through the server to avoid browser CORS block
   mfs100Capture: (quality = 70, options = {}) =>
     api.post('/predictions/mfs100-capture', {
       quality,

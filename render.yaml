@@ -1,0 +1,47 @@
+# render.yaml — Infrastructure-as-Code for Render.com
+# Deploy this repo and Render auto-creates both services.
+
+services:
+  # ── Node.js Backend API ──────────────────────────────────────────────────────
+  - type: web
+    name: bloodgroup-server
+    runtime: node
+    region: oregon
+    rootDir: server
+    buildCommand: npm install
+    startCommand: node server.js
+    plan: free
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGODB_URI
+        sync: false  # Set manually in Render dashboard
+      - key: JWT_SECRET
+        sync: false
+      - key: AES_SECRET_KEY
+        sync: false
+      - key: ML_API_URL
+        sync: false  # Set to your ML service URL after deploying it
+      - key: CORS_ORIGINS
+        sync: false  # Set to your Vercel frontend URL
+      - key: ADMIN_EMAIL
+        value: admin@bloodgroup.com
+      - key: ADMIN_PASSWORD
+        sync: false
+
+  # ── Python Flask ML API ────────────────────────────────────────────────────
+  # NOTE: TensorFlow needs paid tier (512MB+ RAM).
+  # Comment this out if running ML locally only.
+  - type: web
+    name: bloodgroup-ml
+    runtime: python
+    region: oregon
+    rootDir: ml-model
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1 --threads 2
+    plan: starter  # $7/mo — needed for TensorFlow RAM
+    envVars:
+      - key: CORS_ORIGINS
+        sync: false  # Set to your server's URL
+      - key: TF_CPP_MIN_LOG_LEVEL
+        value: "2"

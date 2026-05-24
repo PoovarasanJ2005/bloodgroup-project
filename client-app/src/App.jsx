@@ -1,6 +1,7 @@
 import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
 import { Toaster } from 'react-hot-toast';
 import { AuthProvider } from './context/AuthContext';
+import { ThemeProvider, useTheme } from './context/ThemeContext';
 import { useAuth } from './context/useAuth';
 import AppLayout from './components/layout/AppLayout';
 import Login from './pages/Login';
@@ -77,32 +78,46 @@ const AppRoutes = () => {
   );
 };
 
+const ThemedToaster = () => {
+  const { theme } = useTheme();
+  const isDark = theme === 'dark';
+
+  return (
+    <Toaster
+      position="top-right"
+      toastOptions={{
+        duration: 4000,
+        style: {
+          background: isDark ? 'rgba(15, 15, 30, 0.95)' : 'rgba(255, 255, 255, 0.95)',
+          color: isDark ? '#f1f0f5' : '#1a1033',
+          border: `1px solid ${isDark ? 'rgba(124, 58, 237, 0.2)' : 'rgba(124, 58, 237, 0.15)'}`,
+          backdropFilter: 'blur(20px)',
+          borderRadius: '14px',
+          fontSize: '0.9rem',
+          boxShadow: isDark
+            ? '0 8px 32px rgba(0,0,0,0.4)'
+            : '0 8px 32px rgba(124,58,237,0.1)',
+        },
+        success: {
+          iconTheme: { primary: '#22c55e', secondary: isDark ? '#fff' : '#fff' },
+        },
+        error: {
+          iconTheme: { primary: '#ef4444', secondary: '#fff' },
+        },
+      }}
+    />
+  );
+};
+
 function App() {
   return (
     <Router>
-      <AuthProvider>
-        <Toaster
-          position="top-right"
-          toastOptions={{
-            duration: 4000,
-            style: {
-              background: 'rgba(15, 15, 30, 0.95)',
-              color: '#f1f0f5',
-              border: '1px solid rgba(124, 58, 237, 0.2)',
-              backdropFilter: 'blur(20px)',
-              borderRadius: '12px',
-              fontSize: '0.9rem',
-            },
-            success: {
-              iconTheme: { primary: '#22c55e', secondary: '#fff' },
-            },
-            error: {
-              iconTheme: { primary: '#ef4444', secondary: '#fff' },
-            },
-          }}
-        />
-        <AppRoutes />
-      </AuthProvider>
+      <ThemeProvider>
+        <AuthProvider>
+          <ThemedToaster />
+          <AppRoutes />
+        </AuthProvider>
+      </ThemeProvider>
     </Router>
   );
 }

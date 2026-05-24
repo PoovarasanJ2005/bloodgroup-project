@@ -1,0 +1,101 @@
+{
+  "accuracy": 0.7699335813522339,
+  "loss": 1.100577473640442,
+  "class_report": {
+    "A+": {
+      "precision": 0.7669172932330827,
+      "recall": 0.9026548672566371,
+      "f1-score": 0.8292682926829268,
+      "support": 113.0
+    },
+    "A-": {
+      "precision": 0.7513513513513513,
+      "recall": 0.6881188118811881,
+      "f1-score": 0.7183462532299741,
+      "support": 202.0
+    },
+    "AB+": {
+      "precision": 0.8818897637795275,
+      "recall": 0.7887323943661971,
+      "f1-score": 0.8327137546468402,
+      "support": 142.0
+    },
+    "AB-": {
+      "precision": 0.7210884353741497,
+      "recall": 0.6928104575163399,
+      "f1-score": 0.7066666666666667,
+      "support": 153.0
+    },
+    "B+": {
+      "precision": 0.8620689655172413,
+      "recall": 0.7633587786259542,
+      "f1-score": 0.8097165991902834,
+      "support": 131.0
+    },
+    "B-": {
+      "precision": 0.734375,
+      "recall": 0.9463087248322147,
+      "f1-score": 0.8269794721407625,
+      "support": 149.0
+    },
+    "O+": {
+      "precision": 0.6813725490196079,
+      "recall": 0.8128654970760234,
+      "f1-score": 0.7413333333333333,
+      "support": 171.0
+    },
+    "O-": {
+      "precision": 0.88,
+      "recall": 0.6153846153846154,
+      "f1-score": 0.7242798353909465,
+      "support": 143.0
+    },
+    "accuracy": 0.7699335548172758,
+    "macro avg": {
+      "precision": 0.7848829197843701,
+      "recall": 0.7762792683673962,
+      "f1-score": 0.7736630259102166,
+      "support": 1204.0
+    },
+    "weighted avg": {
+      "precision": 0.7796487703840206,
+      "recall": 0.7699335548172758,
+      "f1-score": 0.7681158186788064,
+      "support": 1204.0
+    }
+  },
+  "class_names": [
+    "A+",
+    "A-",
+    "AB+",
+    "AB-",
+    "B+",
+    "B-",
+    "O+",
+    "O-"
+  ],
+  "epochs_trained": 42,
+  "img_size": 128,
+  "raw_input_size": 256,
+  "model_version": "fingertip_crop_gabor_v2",
+  "architecture": "EfficientNetB0 + fingertip crop + CLAHE + Gabor ridge enhancement",
+  "input_value_range": "0_255",
+  "preprocessing": {
+    "crop": "foreground/skin/texture fingertip crop",
+    "contrast": "CLAHE",
+    "ridge_enhancement": "Gabor filter bank, 12 orientations"
+  },
+  "label_smoothing": 0.1,
+  "train_samples": 4825,
+  "test_samples": 1204,
+  "class_weights": {
+    "A+": 1.311,
+    "A-": 0.747,
+    "AB+": 1.066,
+    "AB-": 0.992,
+    "B+": 1.14,
+    "B-": 1.019,
+    "O+": 0.87,
+    "O-": 1.058
+  }
+}
